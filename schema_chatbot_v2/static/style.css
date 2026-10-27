@@ -1191,6 +1191,11 @@ select option:hover,
     border-color: var(--border);
 }
 
+/* --fg-muted on --bg-hover falls below 4.5:1 in both themes; brighten the meta line on hover. */
+.job-item:hover .job-meta {
+    color: var(--fg);
+}
+
 .job-item-left {
     flex: 1;
     min-width: 0;
