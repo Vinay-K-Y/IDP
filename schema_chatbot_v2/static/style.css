@@ -1,3 +1,22 @@
+:root {
+    --font-sans: 'Fira Sans', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif;
+    --font-mono: 'Fira Code', 'SF Mono', Menlo, Consolas, monospace;
+
+    --text-xs: 12px;
+    --text-sm: 13px;
+    --text-base: 14px;
+    --text-lg: 16px;
+    --text-xl: 18px;
+    --text-2xl: 24px;
+
+    --space-xs: 4px;
+    --space-sm: 8px;
+    --space-md: 16px;
+    --space-lg: 24px;
+    --space-xl: 32px;
+    --space-2xl: 48px;
+}
+
 :root,
 [data-theme="dark"] {
     --bg: #0f172a;
@@ -5,19 +24,31 @@
     --bg-3: #334155;
     --bg-hover: #475569;
     --fg: #f1f5f9;
-    --fg-muted: #94a3b8;
-    --accent: #3b82f6;
-    --accent-hover: #2563eb;
+    --fg-muted: #b4bfcc;
+    --accent: #60a5fa;
+    --accent-hover: #93c5fd;
+    --btn-primary-bg: #2563eb;
+    --btn-primary-hover: #1d4ed8;
+    --btn-success-bg: #047857;
+    --btn-success-hover: #065f46;
+    --btn-danger-bg: #b91c1c;
+    --btn-danger-hover: #991b1b;
+    --cta: #f97316;
+    --cta-hover: #ea580c;
     --success: #10b981;
-    --success-hover: #059669;
+    --success-hover: #34d399;
     --warn: #f59e0b;
-    --danger: #ef4444;
+    --danger: #f87171;
     --border: #475569;
     --border-light: rgba(71, 85, 105, 0.4);
     --radius: 10px;
     --radius-sm: 6px;
-    --shadow: 0 1px 3px rgba(0, 0, 0, 0.3);
-    --card-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.2);
+    --shadow-sm: 0 1px 2px rgba(0, 0, 0, 0.3);
+    --shadow-md: 0 4px 6px -1px rgba(0, 0, 0, 0.25);
+    --shadow-lg: 0 10px 15px -3px rgba(0, 0, 0, 0.35);
+    --shadow-xl: 0 20px 25px -5px rgba(0, 0, 0, 0.5);
+    --shadow: var(--shadow-sm);
+    --card-shadow: var(--shadow-md);
     --code-bg: #1e293b;
     --badge-info-bg: rgba(59, 130, 246, 0.15);
     --badge-info-fg: #93c5fd;
@@ -28,10 +59,10 @@
     --badge-danger-bg: rgba(239, 68, 68, 0.15);
     --badge-danger-fg: #fca5a5;
     --badge-mute-bg: #334155;
-    --badge-mute-fg: #94a3b8;
+    --badge-mute-fg: #b4bfcc;
     --chat-bot-bg: #334155;
     --chat-bot-fg: #f1f5f9;
-    --chat-user-bg: #3b82f6;
+    --chat-user-bg: #2563eb;
     --chat-user-fg: #ffffff;
     --input-bg: #0f172a;
     --table-header-bg: transparent;
@@ -43,26 +74,38 @@
     --bg-3: #e2e8f0;
     --bg-hover: #cbd5e1;
     --fg: #0f172a;
-    --fg-muted: #64748b;
+    --fg-muted: #52606d;
     --accent: #2563eb;
     --accent-hover: #1d4ed8;
-    --success: #059669;
-    --success-hover: #047857;
+    --btn-primary-bg: #2563eb;
+    --btn-primary-hover: #1d4ed8;
+    --btn-success-bg: #047857;
+    --btn-success-hover: #065f46;
+    --btn-danger-bg: #b91c1c;
+    --btn-danger-hover: #991b1b;
+    --cta: #f97316;
+    --cta-hover: #ea580c;
+    --success: #047857;
+    --success-hover: #065f46;
     --warn: #d97706;
-    --danger: #dc2626;
+    --danger: #b91c1c;
     --border: #cbd5e1;
     --border-light: #e2e8f0;
     --radius: 10px;
     --radius-sm: 6px;
-    --shadow: 0 1px 3px rgba(0, 0, 0, 0.08);
-    --card-shadow: 0 4px 12px rgba(37, 99, 235, 0.04), 0 1px 3px rgba(0, 0, 0, 0.05);
+    --shadow-sm: 0 1px 2px rgba(15, 23, 42, 0.06);
+    --shadow-md: 0 4px 12px rgba(15, 23, 42, 0.06);
+    --shadow-lg: 0 10px 20px -4px rgba(15, 23, 42, 0.10);
+    --shadow-xl: 0 20px 25px -5px rgba(15, 23, 42, 0.14);
+    --shadow: var(--shadow-sm);
+    --card-shadow: var(--shadow-md);
     --code-bg: #f8fafc;
     --badge-info-bg: rgba(37, 99, 235, 0.1);
     --badge-info-fg: #1d4ed8;
     --badge-success-bg: rgba(5, 150, 105, 0.1);
     --badge-success-fg: #047857;
     --badge-warn-bg: rgba(217, 119, 6, 0.1);
-    --badge-warn-fg: #b45309;
+    --badge-warn-fg: #92400e;
     --badge-danger-bg: rgba(220, 38, 38, 0.1);
     --badge-danger-fg: #b91c1c;
     --badge-mute-bg: #e2e8f0;
@@ -90,7 +133,7 @@ body {
     display: flex;
     flex-direction: column;
     overflow: hidden;
-    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+    font-family: var(--font-sans);
     background: var(--bg);
     color: var(--fg);
     font-size: 14px;
@@ -120,10 +163,12 @@ h1,
 h2,
 h3 {
     margin: 0;
+    font-family: var(--font-sans);
+    line-height: 1.3;
 }
 
 h2 {
-    font-size: 16px;
+    font-size: var(--text-lg);
 }
 
 .muted {
@@ -164,7 +209,7 @@ h2 {
 }
 
 .header-left h1 {
-    font-size: 18px;
+    font-size: var(--text-xl);
     font-weight: 600;
 }
 
@@ -200,7 +245,7 @@ h2 {
 .theme-toggle-btn:hover {
     border-color: var(--accent);
     background: var(--bg-hover);
-    color: var(--accent);
+    color: var(--fg);
 }
 
 .theme-toggle-icon {
@@ -313,7 +358,7 @@ h2 {
     display: flex;
     justify-content: space-between;
     align-items: center;
-    margin-bottom: 14px;
+    margin-bottom: var(--space-md);
 }
 
 .card-actions {
@@ -360,25 +405,25 @@ h2 {
 }
 
 .btn-primary {
-    background: var(--accent);
+    background: var(--btn-primary-bg);
     color: white;
-    border-color: var(--accent);
+    border-color: var(--btn-primary-bg);
 }
 
 .btn-primary:not(:disabled):hover {
-    background: var(--accent-hover);
-    border-color: var(--accent-hover);
+    background: var(--btn-primary-hover);
+    border-color: var(--btn-primary-hover);
 }
 
 .btn-success {
-    background: var(--success);
+    background: var(--btn-success-bg);
     color: white;
-    border-color: var(--success);
+    border-color: var(--btn-success-bg);
 }
 
 .btn-success:not(:disabled):hover {
-    background: var(--success-hover);
-    border-color: var(--success-hover);
+    background: var(--btn-success-hover);
+    border-color: var(--btn-success-hover);
 }
 
 .btn-warn {
@@ -395,14 +440,14 @@ h2 {
 }
 
 .btn-danger {
-    background: var(--danger);
+    background: var(--btn-danger-bg);
     color: white;
-    border-color: var(--danger);
+    border-color: var(--btn-danger-bg);
 }
 
 .btn-danger:not(:disabled):hover {
-    background: #dc2626;
-    border-color: #dc2626;
+    background: var(--btn-danger-hover);
+    border-color: var(--btn-danger-hover);
 }
 
 .btn-outline {
@@ -512,7 +557,7 @@ h2 {
 
 .doc-name {
     font-weight: 500;
-    font-family: "SF Mono", Menlo, Consolas, monospace;
+    font-family: var(--font-mono);
     font-size: 13px;
 }
 
@@ -564,9 +609,9 @@ h2 {
 }
 
 .preset-btn:hover {
-    background: var(--accent, #3b82f6);
+    background: var(--btn-primary-bg);
     color: #fff;
-    border-color: var(--accent, #3b82f6);
+    border-color: var(--btn-primary-bg);
 }
 
 .schema-panel-container {
@@ -754,7 +799,7 @@ h2 {
 
 #schemaPanel pre {
     margin: 0;
-    font-family: "SF Mono", Menlo, Consolas, monospace;
+    font-family: var(--font-mono);
     font-size: 12px;
     line-height: 1.5;
     color: var(--fg);
@@ -848,7 +893,7 @@ h2 {
 }
 
 .schema-input.field-name-input {
-    font-family: "SF Mono", Menlo, Consolas, monospace;
+    font-family: var(--font-mono);
     color: var(--accent);
     font-weight: 600;
 }
@@ -974,7 +1019,8 @@ h2 {
 }
 
 .form-row select,
-.form-row input[type="text"] {
+.form-row input[type="text"],
+.form-row input[type="password"] {
     width: 100%;
     max-width: 480px;
     padding: 9px 12px;
@@ -1043,7 +1089,7 @@ select option:hover,
 }
 
 .check-item .cname {
-    font-family: "SF Mono", Menlo, Consolas, monospace;
+    font-family: var(--font-mono);
     font-size: 12.5px;
     flex: 1;
 }
@@ -1106,7 +1152,7 @@ select option:hover,
 }
 
 .job-id {
-    font-family: "SF Mono", Menlo, Consolas, monospace;
+    font-family: var(--font-mono);
     font-weight: 600;
     font-size: 12.5px;
 }
@@ -1194,7 +1240,7 @@ select option:hover,
 }
 
 .result-name {
-    font-family: "SF Mono", Menlo, Consolas, monospace;
+    font-family: var(--font-mono);
 }
 
 .result-meta {
@@ -1245,7 +1291,7 @@ select option:hover,
     padding: 32px 28px;
     width: 100%;
     max-width: 400px;
-    box-shadow: 0 20px 25px -5px rgba(0, 0, 0, 0.5), 0 8px 10px -6px rgba(0, 0, 0, 0.5);
+    box-shadow: var(--shadow-xl);
     animation: fadeInModal 0.2s ease-out;
 }
 
@@ -1281,8 +1327,14 @@ select option:hover,
 }
 
 .badge-primary {
-    background: var(--accent);
+    background: var(--btn-primary-bg);
     color: white;
+}
+
+.badge-secondary {
+    background: var(--badge-mute-bg);
+    color: var(--badge-mute-fg);
+    box-shadow: inset 0 0 0 1px var(--border);
 }
 
 /* ========================= Logs & Tables ========================= */
@@ -1304,7 +1356,7 @@ select option:hover,
 .log-terminal {
     background: #090d16;
     color: #38bdf8;
-    font-family: "SF Mono", Menlo, Consolas, monospace;
+    font-family: var(--font-mono);
     font-size: 11.5px;
     line-height: 1.6;
     white-space: pre-wrap;
@@ -1526,7 +1578,7 @@ select option:hover,
 }
 
 .query-bot-send-btn {
-    background: var(--accent);
+    background: var(--btn-primary-bg);
     color: #ffffff;
     border: none;
     padding: 8px 16px;
@@ -1539,7 +1591,7 @@ select option:hover,
 }
 
 .query-bot-send-btn:hover:not(:disabled) {
-    background: var(--accent-hover);
+    background: var(--btn-primary-hover);
 }
 
 .query-bot-send-btn:disabled {
@@ -1569,8 +1621,8 @@ select option:hover,
 }
 
 .query-bot-chip:hover {
-    background: var(--accent);
-    border-color: var(--accent);
+    background: var(--btn-primary-bg);
+    border-color: var(--btn-primary-bg);
     color: #ffffff;
     transform: translateY(-1px);
 }
@@ -1635,4 +1687,181 @@ select option:hover,
     display: flex;
     align-items: center;
     gap: 8px;
+}
+
+/* ========================= Global Interaction States ========================= */
+
+/* !important is needed because many form controls set outline: none on :focus,
+   which would otherwise win on specificity. */
+:focus-visible {
+    outline: 2px solid var(--accent) !important;
+    outline-offset: 2px;
+}
+
+button:disabled,
+input:disabled,
+select:disabled,
+textarea:disabled {
+    cursor: not-allowed;
+    opacity: 0.5;
+}
+
+.tab-btn,
+.req-toggle,
+.btn-del-field,
+.check-item,
+.preset-btn,
+.job-item,
+.theme-toggle-btn,
+.query-bot-chip,
+.query-bot-send-btn,
+#logoutBtn {
+    cursor: pointer;
+}
+
+.check-item:has(input:disabled) {
+    cursor: not-allowed;
+}
+
+/* ========================= Reduced Motion ========================= */
+
+@media (prefers-reduced-motion: reduce) {
+    *,
+    *::before,
+    *::after {
+        animation-duration: 0.01ms !important;
+        animation-iteration-count: 1 !important;
+        transition-duration: 0.01ms !important;
+        scroll-behavior: auto !important;
+    }
+
+    /* Keep the loading spinner visibly active, but slower. */
+    .spinner {
+        animation-duration: 2s !important;
+        animation-iteration-count: infinite !important;
+    }
+
+    .login-card {
+        animation: none !important;
+    }
+}
+
+/* ========================= Responsive ========================= */
+
+@media (max-width: 1024px) {
+    .app-header {
+        padding: 12px 16px;
+    }
+
+    .tabs {
+        padding: 0 16px;
+    }
+
+    .tab-btn {
+        padding: 12px 14px;
+    }
+
+    .content {
+        padding: var(--space-md);
+    }
+}
+
+@media (max-width: 768px) {
+    .app-header {
+        flex-wrap: wrap;
+        gap: 10px 12px;
+    }
+
+    .header-right {
+        flex-wrap: wrap;
+        gap: 8px;
+    }
+
+    .tabs {
+        overflow-x: auto;
+        overflow-y: hidden;
+        scrollbar-width: thin;
+    }
+
+    .tab-btn {
+        flex: 0 0 auto;
+        white-space: nowrap;
+    }
+
+    .card {
+        padding: var(--space-md);
+    }
+
+    .card-header,
+    .card-actions {
+        flex-wrap: wrap;
+        gap: var(--space-sm);
+    }
+
+    .job-summary-grid {
+        grid-template-columns: 1fr;
+    }
+
+    .doc-type-edit-row,
+    .doc-item,
+    .job-item,
+    .user-job-row,
+    .schema-bottom-actions {
+        flex-wrap: wrap;
+        gap: var(--space-sm);
+    }
+
+    /* Tables scroll inside their container instead of pushing the page wider. */
+    #schemaPanel,
+    #usersListTable,
+    .logs-container {
+        overflow-x: auto;
+    }
+
+    .schema-table,
+    .log-table {
+        min-width: 640px;
+    }
+
+    /* 16px keeps mobile browsers from zooming into form fields on focus. */
+    .form-row select,
+    .form-row input[type="text"],
+    .chat-input-row input,
+    .query-bot-input,
+    #logFilterUsername,
+    .schema-input,
+    .doc-type-input {
+        font-size: 16px;
+    }
+}
+
+@media (max-width: 375px) {
+    .login-overlay {
+        padding: var(--space-md);
+    }
+
+    .login-card {
+        width: min(100%, 400px);
+        min-width: 0;
+    }
+
+    .app-header {
+        padding: 10px 12px;
+    }
+
+    .header-left h1 {
+        font-size: var(--text-lg);
+    }
+
+    .theme-toggle-btn {
+        padding: 6px 10px;
+    }
+
+    .content {
+        padding: var(--space-sm);
+    }
+
+    .card {
+        padding: 14px;
+    }
 }
