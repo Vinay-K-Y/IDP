@@ -745,6 +745,20 @@ class GraphMemoryManager:
 
         return (round(min(1.0, max(0.0, score)), 4), signals)
 
+    def _is_same_entity_pair(self, a: GraphNode, b: GraphNode) -> bool:
+        """True when two existing nodes denote one entity: linked by SAME_ENTITY_AS or
+        POSSIBLY_SAME_AS in either direction, or both are person nodes whose names
+        read as the same person."""
+        for rel in ("SAME_ENTITY_AS", "POSSIBLY_SAME_AS"):
+            if self.graph.get_edges(source_node=a.id, target_node=b.id, relationship=rel) or \
+               self.graph.get_edges(source_node=b.id, target_node=a.id, relationship=rel):
+                return True
+        both_person = (
+            self._normalize(a.type) in CLUSTER_PERSON
+            and self._normalize(b.type) in CLUSTER_PERSON
+        )
+        return both_person and _person_name_relation(a.value, b.value) == "same"
+
     def resolve_entity(
         self,
         incoming: GraphNode,
@@ -886,7 +900,11 @@ class GraphMemoryManager:
         # ---------------------------------------------------------
         valid_evals.sort(key=lambda x: x.candidate_score, reverse=True)
         top = valid_evals[0]
-        second = valid_evals[1] if len(valid_evals) > 1 else None
+        # Candidates that are the same real entity as top are not competitors.
+        second = next(
+            (e for e in valid_evals[1:] if not self._is_same_entity_pair(top.candidate_node, e.candidate_node)),
+            None,
+        )
 
         top_score = top.candidate_score
         second_score = second.candidate_score if second else 0.0
@@ -1166,6 +1184,31 @@ class GraphMemoryManager:
                     )
                     self.graph.create_node(unc_node)
                     canonical_id = node_id
+
+                    # Link the uncertain node to the candidate it may be (not for amount/date types).
+                    winner = decision.winning_candidate
+                    if winner and not self._is_amount_date(ent.type):
+                        existing_possible = self.graph.get_edges(
+                            source_node=node_id,
+                            target_node=winner.candidate_id,
+                            relationship="POSSIBLY_SAME_AS",
+                        )
+                        if not existing_possible:
+                            possible_edge = GraphEdge(
+                                id=self._gen_edge_id(page_num, _ent_seq, prefix="edge_possible"),
+                                source_node=node_id,
+                                target_node=winner.candidate_id,
+                                relationship="POSSIBLY_SAME_AS",
+                                evidence=decision.rationale,
+                                source_page=page_num,
+                                confidence=decision.candidate_score,
+                                status="UNCERTAIN",
+                                properties={"derived": True, "rule": "uncertain_match_candidate"},
+                            )
+                            try:
+                                self.graph.create_edge(possible_edge)
+                            except Exception as exc:
+                                logger.debug("graph.possibly_same_link.skip", error=str(exc))
 
                     logger.info(
                         "entity_resolution.uncertain",

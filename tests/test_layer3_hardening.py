@@ -1589,3 +1589,87 @@ def test_person_name_contradiction_gate_order_and_conflict():
     assert blocked2 and any("CONFLICTING_PERSON_NAMES" in r for r in reasons2), reasons2
 
 
+@async_test
+async def test_uncertain_commit_creates_single_possibly_same_as_edge():
+    """An UNCERTAIN_MATCH commit links the uncertain node to its candidate with one
+    POSSIBLY_SAME_AS edge, and re-ingesting the same delta does not add another."""
+    manager = GraphMemoryManager(anchor_types=["Patient"], ambiguity_margin=0.20)
+    manager.graph.create_node(GraphNode(id="cand_1", type="Patient", label="Patient", value="Robert James Smith", source_pages=[1]))
+    manager.graph.create_node(GraphNode(id="cand_2", type="Patient", label="Patient", value="Robert John Smith", source_pages=[1]))
+    incoming = GraphNode(id="inc_1", type="Patient", label="Patient", value="Robert Smith", source_pages=[2])
+    delta = PageDelta(page_number=2, entities=[incoming])
+
+    await manager.ingest_page_delta(delta, delta_checksum="chk_possibly")
+    unc_nodes = [n for n in manager.graph.nodes.values() if n.status == "UNCERTAIN"]
+    assert len(unc_nodes) == 1
+    unc = unc_nodes[0]
+    target = unc.properties["uncertain_candidate_id"]
+
+    edges = manager.graph.get_edges(source_node=unc.id, target_node=target, relationship="POSSIBLY_SAME_AS")
+    assert len(edges) == 1
+    assert edges[0].status == "UNCERTAIN"
+    assert edges[0].confidence == unc.properties["candidate_score"]
+    assert edges[0].evidence == unc.properties["rationale"]
+
+    # Same delta re-ingested: idempotent no-op, no second edge or node
+    await manager.ingest_page_delta(delta, delta_checksum="chk_possibly")
+    assert len(manager.graph.get_edges(source_node=unc.id, target_node=target, relationship="POSSIBLY_SAME_AS")) == 1
+    assert len([n for n in manager.graph.nodes.values() if n.status == "UNCERTAIN"]) == 1
+
+
+@async_test
+async def test_margin_ignores_candidates_linked_as_same_entity():
+    """Two existing nodes linked as the same entity are not competitors: a third matching
+    mention confirms to the better one instead of returning INSUFFICIENT_MARGIN."""
+    manager = GraphMemoryManager(anchor_types=["Patient"], ambiguity_margin=0.20)
+    manager.graph.create_node(GraphNode(id="pat_a", type="Patient", label="Patient", value="Alice Johnson", source_pages=[1]))
+    manager.graph.create_node(GraphNode(id="pat_b", type="Patient", label="Patient", value="Johnson Alice", source_pages=[2]))
+    manager.graph.create_edge(GraphEdge(
+        id="edge_same_ab", source_node="pat_a", target_node="pat_b",
+        relationship="SAME_ENTITY_AS", status="DERIVED", source_page=1,
+    ))
+    incoming = GraphNode(id="inc_alice", type="Patient", label="Patient", value="Alice Johnson", source_pages=[3])
+
+    decision = manager.resolve_entity(incoming, page_num=3)
+    assert decision.status == ResolutionStatus.CONFIRMED_MATCH
+    assert decision.canonical_id == "pat_a"
+    assert decision.resolution_method != "INSUFFICIENT_MARGIN"
+
+    await manager.ingest_page_delta(PageDelta(page_number=3, entities=[incoming]))
+    assert not [n for n in manager.graph.nodes.values() if n.status == "UNCERTAIN"]
+
+
+@async_test
+async def test_uncertain_distinct_candidates_still_remain_uncertain():
+    """Two distinct, near-scoring candidates that pass the hard gates and are not linked
+    keep the incoming mention UNCERTAIN_MATCH because of the margin check."""
+    manager = GraphMemoryManager(anchor_types=["Patient"], ambiguity_margin=0.20)
+    manager.graph.create_node(GraphNode(id="rj_smith", type="Patient", label="Patient", value="Robert James Smith", source_pages=[1]))
+    manager.graph.create_node(GraphNode(id="rj_john", type="Patient", label="Patient", value="Robert John Smith", source_pages=[1]))
+    incoming = GraphNode(id="inc_rsmith", type="Patient", label="Patient", value="Robert Smith", source_pages=[2])
+
+    assert _person_name_relation("Robert James Smith", "Robert John Smith") == "conflict"
+    decision = manager.resolve_entity(incoming, page_num=2)
+    assert decision.status == ResolutionStatus.UNCERTAIN_MATCH
+    assert decision.resolution_method == "INSUFFICIENT_MARGIN"
+    assert decision.decision_margin < manager.ambiguity_margin
+    assert not manager.graph.get_edges(source_node="rj_smith", target_node="rj_john", relationship="SAME_ENTITY_AS")
+    assert not manager.graph.get_edges(source_node="rj_john", target_node="rj_smith", relationship="SAME_ENTITY_AS")
+
+
+def test_initial_mention_confirms_to_candidate_after_gate_removes_other():
+    """"A. Sharma" vs "Ramesh Sharma" is blocked by the person-name gate, so the mention
+    confirms to Arun Sharma rather than becoming UNCERTAIN_MATCH."""
+    manager = GraphMemoryManager(anchor_types=["Patient"])
+    manager.graph.create_node(GraphNode(id="arun", type="Patient", label="Patient", value="Arun Sharma", source_pages=[1]))
+    manager.graph.create_node(GraphNode(id="ramesh", type="Patient", label="Patient", value="Ramesh Sharma", source_pages=[1]))
+    incoming = GraphNode(id="inc_sharma", type="Patient", label="Patient", value="A. Sharma", source_pages=[2])
+
+    blocked, reasons = manager.check_hard_contradictions(incoming, manager.graph.get_node("ramesh"))
+    assert blocked and any("CONFLICTING_PERSON_NAMES" in r for r in reasons), reasons
+
+    decision = manager.resolve_entity(incoming, page_num=2)
+    assert decision.status == ResolutionStatus.CONFIRMED_MATCH
+    assert decision.canonical_id == "arun"
+
+
