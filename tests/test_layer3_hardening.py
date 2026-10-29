@@ -32,6 +32,7 @@ from src.ai.layer3_extraction.graph_agent.memory_manager import (
     GraphMemoryManager,
     PageDelta,
     UnresolvedRef,
+    _org_name_relation,
     _person_name_relation,
 )
 from src.ai.layer3_extraction.graph_agent.models import (
@@ -1587,6 +1588,123 @@ def test_person_name_contradiction_gate_order_and_conflict():
                            value="Chander Kochhar", source_pages=[2])
     blocked2, reasons2 = manager.check_hard_contradictions(other_in, other_cand)
     assert blocked2 and any("CONFLICTING_PERSON_NAMES" in r for r in reasons2), reasons2
+
+
+@pytest.mark.parametrize("a,b", [
+    ("P. D. HINDUJA HOSPITAL & MEDICAL RESEARCH CENTRE", "P.D.HINDUJA HOSPITAL & MEDICAL RESEARCH CENTRE"),
+    ("Acme Corp Ltd", "ACME CORP"),
+    ("X - Y", "X – Y"),
+])
+def test_org_name_relation_same(a, b):
+    assert _org_name_relation(a, b) == "same"
+    assert _org_name_relation(b, a) == "same"
+
+
+@pytest.mark.parametrize("a,b", [
+    ("Hinduja Hospital", "P. D. Hinduja Hospital & Medical Research Centre"),
+])
+def test_org_name_relation_possible(a, b):
+    assert _org_name_relation(a, b) == "possible"
+    assert _org_name_relation(b, a) == "possible"
+
+
+@pytest.mark.parametrize("a,b", [
+    ("DEPARTMENT OF LABORATORY MEDICINE - HEMATOLOGY", "DEPARTMENT OF LABORATORY MEDICINE - SEROLOGY"),
+    ("St Mary Hospital", "St Mark Hospital"),
+    ("Alpha Bank", "Beta Bank"),
+    ("Acme Steel Works", "Acme Paper Mills"),
+])
+def test_org_name_relation_conflict(a, b):
+    assert _org_name_relation(a, b) == "conflict"
+    assert _org_name_relation(b, a) == "conflict"
+
+
+@pytest.mark.parametrize("a,b", [
+    ("ICICI Lombard", "ICICILOMBARD GENERAL INSURANCE COMPA"),
+    ("ICICILOMBARD GENERAL INSURANCE COMPANY LTD", "ICICILOMBARD GENERAL INSURANCE COMPA"),
+    ("ICICILOMBARD GENERAL INSURANCE COMPANY LTD", "ICICI Lombard GIC"),
+    ("ICICILOMBARD GENERAL INSURANCE COMPANY LTD", "ICICI Lombard"),
+    ("ICICILOMBARD GENERAL INSURANCECOMPANYLTD", "ICICILOMBARD GENERAL INSURANCE COMPANY LTD"),
+    ("ICICILOMBARD GENERAL INSURANCE COMPAT", "ICICILOMBARD GENERAL INSURANCE COMPA"),
+    ("ICICILOMBARD GENERAL INSURANCE COMPAT", "ICICILOMBARD GENERAL INSURANCE COMPANY LTD"),
+])
+def test_org_name_relation_ocr_variants_not_conflict(a, b):
+    assert _org_name_relation(a, b) in {"same", "possible"}
+    assert _org_name_relation(b, a) in {"same", "possible"}
+
+
+def test_org_name_relation_glued_suffix_is_same():
+    assert _org_name_relation(
+        "ICICILOMBARD GENERAL INSURANCECOMPANYLTD",
+        "ICICILOMBARD GENERAL INSURANCE COMPANY LTD",
+    ) in {"same", "possible"}
+
+
+def test_org_name_relation_unknown_for_single_token_subset():
+    assert _org_name_relation("Acme", "Acme Industries Group") == "unknown"
+    assert _org_name_relation("Acme Industries Group", "Acme") == "unknown"
+
+
+def test_org_name_contradiction_gate_does_not_block_ocr_variant():
+    manager = GraphMemoryManager()
+    short_form = GraphNode(id="ins_short", type="Organization", label="organization",
+                           value="ICICI Lombard", source_pages=[1])
+    full_form = GraphNode(id="ins_full", type="Organization", label="organization",
+                          value="ICICILOMBARD GENERAL INSURANCE COMPANY LTD", source_pages=[2])
+    blocked, reasons = manager.check_hard_contradictions(short_form, full_form)
+    assert not blocked, reasons
+
+
+def test_org_name_contradiction_gate_blocks_conflict_but_not_punctuation_variant():
+    manager = GraphMemoryManager()
+    hematology = GraphNode(id="lab_hem", type="Organization", label="organization",
+                           value="DEPARTMENT OF LABORATORY MEDICINE - HEMATOLOGY", source_pages=[1])
+    serology = GraphNode(id="lab_ser", type="Organization", label="organization",
+                         value="DEPARTMENT OF LABORATORY MEDICINE - SEROLOGY", source_pages=[2])
+    blocked, reasons = manager.check_hard_contradictions(hematology, serology)
+    assert blocked and any("CONFLICTING_ORG_NAMES" in r for r in reasons), reasons
+
+    spaced = GraphNode(id="hin_sp", type="Organization", label="organization",
+                       value="P. D. HINDUJA HOSPITAL & MEDICAL RESEARCH CENTRE", source_pages=[1])
+    squashed = GraphNode(id="hin_sq", type="Organization", label="organization",
+                         value="P.D.HINDUJA HOSPITAL & MEDICAL RESEARCH CENTRE", source_pages=[2])
+    blocked2, reasons2 = manager.check_hard_contradictions(spaced, squashed)
+    assert not blocked2, reasons2
+
+
+def test_org_name_same_scores_0_90_before_type_bonus():
+    manager = GraphMemoryManager()
+    # Different organisation types so the exact-type +0.05 bonus does not apply
+    incoming = GraphNode(id="os_in", type="Hospital", label="organization",
+                         value="P.D.HINDUJA HOSPITAL & MEDICAL RESEARCH CENTRE", source_pages=[2])
+    candidate = GraphNode(id="os_cand", type="Organization", label="organization",
+                          value="P. D. HINDUJA HOSPITAL & MEDICAL RESEARCH CENTRE", source_pages=[1])
+    score, signals = manager.score_candidate(incoming, candidate)
+    assert score == 0.90
+    assert signals == ["NORMALIZED_ORG_NAME_MATCH"]
+
+
+def test_org_name_reuse_boost_respects_possible_threshold():
+    manager = GraphMemoryManager()
+    # "possible" org pair with an LLM reuse proposal must stay at 0.80, below match_threshold
+    possible_in = GraphNode(id="or_pin", type="Organization", label="organization",
+                            value="Hinduja Hospital", source_pages=[2])
+    possible_cand = GraphNode(id="or_pcand", type="Organization", label="organization",
+                              value="P. D. Hinduja Hospital & Medical Research Centre", source_pages=[1])
+    p_score, p_signals = manager.score_candidate(possible_in, possible_cand, proposed_reused_id="or_pcand")
+    assert p_score == 0.80
+    assert p_signals == ["ORG_NAME_SUBSET_POSSIBLE"]
+    assert p_score < manager.match_threshold
+
+    # "same" org pair with the same proposal still receives the boost, capped at 1.0
+    same_in = GraphNode(id="or_sin", type="Organization", label="organization",
+                        value="P.D.HINDUJA HOSPITAL & MEDICAL RESEARCH CENTRE", source_pages=[2])
+    same_cand = GraphNode(id="or_scand", type="Organization", label="organization",
+                          value="P. D. HINDUJA HOSPITAL & MEDICAL RESEARCH CENTRE", source_pages=[1])
+    s_score, s_signals = manager.score_candidate(same_in, same_cand, proposed_reused_id="or_scand")
+    assert "NORMALIZED_ORG_NAME_MATCH" in s_signals
+    assert "LLM_PROPOSED_REUSE" in s_signals
+    assert s_score == 1.0
 
 
 @async_test

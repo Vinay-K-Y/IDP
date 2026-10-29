@@ -223,6 +223,242 @@ def _person_name_relation(a: str, b: str) -> str:
     return "unknown"
 
 
+_ORG_LEGAL_SUFFIX_TOKENS = frozenset({"ltd", "limited", "pvt", "private", "inc", "llc", "corp", "co"})
+_ORG_DASH_RE = re.compile(r"[\-\u2010-\u2015\u2212\ufe58\ufe63\uff0d]")
+_ORG_PUNCT_RE = re.compile(r"[\W_]+")
+_ORG_GLUED_SUFFIXES = ("ltd", "limited", "inc", "llc", "corp")
+
+
+def _org_strip_glued_suffix(token: str) -> str:
+    """Drop a legal suffix glued to the end of a token, e.g. "companyltd" -> "company".
+    The remainder must keep at least 4 characters."""
+    for suffix in _ORG_GLUED_SUFFIXES:
+        if token.endswith(suffix) and len(token) - len(suffix) >= 4:
+            return token[: -len(suffix)]
+    return token
+
+
+def _org_name_forms(name: str) -> Tuple[List[str], str]:
+    """Return (tokens, squashed) for an organisation name. Dashes of any kind become
+    spaces, "&" becomes "and", punctuation is dropped, and generic legal-suffix tokens
+    are removed. Legal suffixes glued to a word are stripped. The squashed form is the
+    tokens joined without spaces."""
+    text = (name or "").lower()
+    text = _ORG_DASH_RE.sub(" ", text)
+    text = text.replace("&", " and ")
+    text = _ORG_PUNCT_RE.sub(" ", text)
+    tokens = [
+        _org_strip_glued_suffix(t)
+        for t in text.split()
+        if t not in _ORG_LEGAL_SUFFIX_TOKENS
+    ]
+    return tokens, "".join(tokens)
+
+
+def _org_token_similarity(x: str, y: str) -> float:
+    """Exact tokens score 1.0. Fuzzy ratio is used only when both tokens have >= 6 characters."""
+    if x == y:
+        return 1.0
+    if len(x) >= 6 and len(y) >= 6:
+        return difflib.SequenceMatcher(None, x, y).ratio()
+    return 0.0
+
+
+def _org_match_tokens(tokens_a: List[str], tokens_b: List[str]) -> Tuple[Set[int], Set[int]]:
+    """Greedy one-to-one token matching, best similarity first. Returns the matched
+    index sets for each side."""
+    pairs = []
+    for i, a_tok in enumerate(tokens_a):
+        for j, b_tok in enumerate(tokens_b):
+            sim = _org_token_similarity(a_tok, b_tok)
+            if sim >= 0.85:
+                pairs.append((-sim, i, j))
+    pairs.sort()
+
+    used_a: Set[int] = set()
+    used_b: Set[int] = set()
+    for _neg_sim, i, j in pairs:
+        if i in used_a or j in used_b:
+            continue
+        used_a.add(i)
+        used_b.add(j)
+    return used_a, used_b
+
+
+def _org_glue_pass(
+    src: List[str],
+    src_status: List[Optional[str]],
+    dst: List[str],
+    dst_status: List[Optional[str]],
+    soft: bool,
+) -> None:
+    """Match one unmatched token in ``src`` against a run of >= 2 consecutive unmatched
+    tokens in ``dst`` whose concatenation equals it (exact glue, "strong") or is
+    prefix-related to it (soft glue, when the shorter part has >= 4 characters)."""
+    for i, tok in enumerate(src):
+        if src_status[i] is not None:
+            continue
+        found = None
+        for start in range(len(dst)):
+            if dst_status[start] is not None:
+                continue
+            glued = ""
+            for end in range(start, len(dst)):
+                if dst_status[end] is not None:
+                    break
+                glued += dst[end]
+                if end == start:
+                    continue
+                if soft:
+                    related = (
+                        min(len(glued), len(tok)) >= 4
+                        and (glued.startswith(tok) or tok.startswith(glued))
+                    )
+                else:
+                    related = glued == tok
+                if related:
+                    found = (start, end)
+                    break
+            if found:
+                break
+        if found:
+            status = "soft" if soft else "strong"
+            src_status[i] = status
+            for j in range(found[0], found[1] + 1):
+                dst_status[j] = status
+
+
+def _org_acronym_pass(
+    src: List[str],
+    src_status: List[Optional[str]],
+    dst: List[str],
+    dst_status: List[Optional[str]],
+) -> None:
+    """Soft-match a 2-5 character token in ``src`` against the initials of a run of >= 2
+    consecutive unmatched tokens in ``dst``."""
+    for i, tok in enumerate(src):
+        if src_status[i] is not None or not 2 <= len(tok) <= 5:
+            continue
+        found = None
+        for start in range(len(dst)):
+            if dst_status[start] is not None:
+                continue
+            initials = ""
+            for end in range(start, len(dst)):
+                if dst_status[end] is not None:
+                    break
+                initials += dst[end][0]
+                if end > start and initials == tok:
+                    found = (start, end)
+                    break
+            if found:
+                break
+        if found:
+            src_status[i] = "soft"
+            for j in range(found[0], found[1] + 1):
+                dst_status[j] = "soft"
+
+
+def _org_common_prefix_len(x: str, y: str) -> int:
+    n = 0
+    for cx, cy in zip(x, y):
+        if cx != cy:
+            break
+        n += 1
+    return n
+
+
+def _org_truncation_pass(
+    tokens_a: List[str],
+    status_a: List[Optional[str]],
+    tokens_b: List[str],
+    status_b: List[Optional[str]],
+) -> None:
+    """Soft-match truncated tokens. A token of >= 4 characters that is a prefix of an
+    unmatched token on the other side matches. The last token of either side also
+    matches an unmatched token on the other side when they share a prefix of >= 4
+    characters (end-of-line OCR truncation)."""
+    last_a = len(tokens_a) - 1
+    last_b = len(tokens_b) - 1
+    for i, ta in enumerate(tokens_a):
+        if status_a[i] is not None:
+            continue
+        for j, tb in enumerate(tokens_b):
+            if status_b[j] is not None:
+                continue
+            short, long_ = sorted((ta, tb), key=len)
+            prefix_match = len(short) >= 4 and long_.startswith(short)
+            last_match = (
+                (i == last_a or j == last_b)
+                and _org_common_prefix_len(ta, tb) >= 4
+            )
+            if prefix_match or last_match:
+                status_a[i] = "soft"
+                status_b[j] = "soft"
+                break
+
+
+def _org_align_tokens(
+    tokens_a: List[str], tokens_b: List[str]
+) -> Tuple[List[Optional[str]], List[Optional[str]]]:
+    """Mark each token on both sides as "strong", "soft" or None (unmatched)."""
+    status_a: List[Optional[str]] = [None] * len(tokens_a)
+    status_b: List[Optional[str]] = [None] * len(tokens_b)
+
+    used_a, used_b = _org_match_tokens(tokens_a, tokens_b)
+    for i in used_a:
+        status_a[i] = "strong"
+    for j in used_b:
+        status_b[j] = "strong"
+
+    _org_glue_pass(tokens_a, status_a, tokens_b, status_b, soft=False)
+    _org_glue_pass(tokens_b, status_b, tokens_a, status_a, soft=False)
+    _org_glue_pass(tokens_a, status_a, tokens_b, status_b, soft=True)
+    _org_glue_pass(tokens_b, status_b, tokens_a, status_a, soft=True)
+    _org_acronym_pass(tokens_a, status_a, tokens_b, status_b)
+    _org_acronym_pass(tokens_b, status_b, tokens_a, status_a)
+    _org_truncation_pass(tokens_a, status_a, tokens_b, status_b)
+    return status_a, status_b
+
+
+def _org_name_relation(a: str, b: str) -> str:
+    """Classify two organisation names as "same", "possible", "conflict" or "unknown".
+
+    Tokens are matched in passes: exact or near-exact, glued words, acronyms, and
+    truncations. Only the first pass counts as a strong match.
+
+    - same: squashed forms are equal, or every token on both sides is strongly matched.
+    - possible: the shorter side (>= 2 tokens) is fully matched, or some tokens matched
+      softly, or one squashed form is a prefix of the other (squashed form >= 6 chars).
+    - conflict: both sides have >= 2 tokens and each side has at least one unmatched token.
+    - unknown: anything else (for example single-token names or empty input).
+    """
+    tokens_a, key_a = _org_name_forms(a)
+    tokens_b, key_b = _org_name_forms(b)
+    if not tokens_a or not tokens_b:
+        return "unknown"
+
+    status_a, status_b = _org_align_tokens(tokens_a, tokens_b)
+    unmatched_a = status_a.count(None)
+    unmatched_b = status_b.count(None)
+    all_strong = all(s == "strong" for s in status_a + status_b)
+
+    if key_a == key_b or (unmatched_a == 0 and unmatched_b == 0 and all_strong):
+        return "same"
+
+    if min(len(tokens_a), len(tokens_b)) < 2:
+        relation = "unknown"
+    elif unmatched_a == 0 or unmatched_b == 0:
+        relation = "possible"
+    else:
+        relation = "conflict"
+
+    short_key, long_key = sorted((key_a, key_b), key=len)
+    if relation != "possible" and len(short_key) >= 6 and long_key.startswith(short_key):
+        relation = "possible"
+    return relation
+
+
 class GraphMemoryManager:
     """
     Central Blackboard / Memory Manager for Layer 3 extraction.
@@ -457,6 +693,16 @@ class GraphMemoryManager:
                     f"CONFLICTING_PERSON_NAMES: '{self.clean_person_name(incoming.value)}' vs '{self.clean_person_name(candidate.value)}'"
                 )
 
+        # 5. Conflicting distinct organisation names (e.g. "X Dept - Alpha" vs "X Dept - Beta").
+        #    Punctuation-only and OCR variants are not a conflict.
+        incoming_org = self._normalize(incoming.type) in CLUSTER_ORGANIZATION
+        candidate_org = self._normalize(candidate.type) in CLUSTER_ORGANIZATION
+        if not is_alias_match and incoming_org and candidate_org:
+            if _org_name_relation(incoming.value, candidate.value) == "conflict":
+                reasons.append(
+                    f"CONFLICTING_ORG_NAMES: '{incoming.value}' vs '{candidate.value}'"
+                )
+
         return (len(reasons) > 0, reasons)
 
     # Node types with amount/date semantics for which a value match alone is NOT
@@ -684,6 +930,12 @@ class GraphMemoryManager:
         )
         name_relation = _person_name_relation(incoming.value, candidate.value) if is_person_pair else "unknown"
 
+        is_org_pair = (
+            self._normalize(incoming.type) in CLUSTER_ORGANIZATION
+            and self._normalize(candidate.type) in CLUSTER_ORGANIZATION
+        )
+        org_relation = _org_name_relation(incoming.value, candidate.value) if is_org_pair else "unknown"
+
         # Exact normalized match
         if val_in == val_cand:
             score = 1.0
@@ -707,6 +959,15 @@ class GraphMemoryManager:
             # Kept at 0.80 (below match_threshold): the exact-type bonus is skipped for this branch
             score = 0.80
             signals.append("NAME_PREFIX_POSSIBLE")
+            skip_type_bonus = True
+        # Organisation names that match after punctuation, spacing, dash or "&" normalisation
+        elif org_relation == "same":
+            score = 0.90
+            signals.append("NORMALIZED_ORG_NAME_MATCH")
+        elif org_relation == "possible":
+            # Kept at 0.80 (below match_threshold), same treatment as the person "possible" branch
+            score = 0.80
+            signals.append("ORG_NAME_SUBSET_POSSIBLE")
             skip_type_bonus = True
         # Substring / containment match
         elif (val_in in val_cand or val_cand in val_in) and min(len(val_in), len(val_cand)) > 3:
@@ -734,6 +995,7 @@ class GraphMemoryManager:
             proposed_reused_id
             and candidate.id == proposed_reused_id
             and "NAME_PREFIX_POSSIBLE" not in signals
+            and "ORG_NAME_SUBSET_POSSIBLE" not in signals
         ):
             score = min(1.0, score + 0.05)
             signals.append("LLM_PROPOSED_REUSE")
@@ -757,7 +1019,13 @@ class GraphMemoryManager:
             self._normalize(a.type) in CLUSTER_PERSON
             and self._normalize(b.type) in CLUSTER_PERSON
         )
-        return both_person and _person_name_relation(a.value, b.value) == "same"
+        if both_person and _person_name_relation(a.value, b.value) == "same":
+            return True
+        both_org = (
+            self._normalize(a.type) in CLUSTER_ORGANIZATION
+            and self._normalize(b.type) in CLUSTER_ORGANIZATION
+        )
+        return both_org and _org_name_relation(a.value, b.value) == "same"
 
     def resolve_entity(
         self,
