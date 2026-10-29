@@ -14,6 +14,7 @@ Hardened with:
 from __future__ import annotations
 
 import asyncio
+import difflib
 import hashlib
 import json
 import re
@@ -143,6 +144,85 @@ def derive_anchor_types_from_schema(schema: type[BaseModel]) -> List[str]:
     return derived
 
 
+_PERSON_HONORIFIC_TOKENS = frozenset({"dr", "mr", "mrs", "ms", "miss", "prof", "shri", "smt", "md"})
+
+
+def _person_name_tokens(name: str) -> List[str]:
+    """Lowercase, drop punctuation, and strip leading honorific tokens."""
+    text = (name or "").lower().replace(".", " ").replace(",", " ")
+    tokens = text.split()
+    while tokens and tokens[0] in _PERSON_HONORIFIC_TOKENS:
+        tokens.pop(0)
+    return tokens
+
+
+def _person_token_match(x: str, y: str) -> Tuple[float, bool]:
+    """Return (similarity, soft). A single-letter token matches a token with the same
+    first letter (similarity 1.0). Otherwise similarity is difflib's ratio. soft is True
+    when one token is a prefix of the other (min length 4) and similarity is below 0.80."""
+    if x == y:
+        return 1.0, False
+    if len(x) == 1 or len(y) == 1:
+        return (1.0 if x[0] == y[0] else 0.0), False
+    ratio = difflib.SequenceMatcher(None, x, y).ratio()
+    if ratio >= 0.80:
+        return ratio, False
+    shorter, longer = (x, y) if len(x) <= len(y) else (y, x)
+    return ratio, len(shorter) >= 4 and longer.startswith(shorter)
+
+
+def _person_name_relation(a: str, b: str) -> str:
+    """Classify two person names as "same", "possible", "conflict" or "unknown".
+
+    Tokens are compared order-insensitively with a greedy one-to-one match of the
+    shorter token list onto the longer one (best similarity first).
+    - same: shorter list has >= 2 tokens and every token matches strongly.
+    - possible: >= 2 tokens, all matched, at least one only by prefix.
+    - conflict: >= 2 tokens, at least one token matches and at least one token has
+      no match above 0.5.
+    - unknown: anything else (for example single-token names).
+    """
+    tokens_a = _person_name_tokens(a)
+    tokens_b = _person_name_tokens(b)
+    short, long_ = (tokens_a, tokens_b) if len(tokens_a) <= len(tokens_b) else (tokens_b, tokens_a)
+    if len(short) < 2:
+        return "unknown"
+
+    pairs = []
+    for i, s_tok in enumerate(short):
+        for j, l_tok in enumerate(long_):
+            sim, soft = _person_token_match(s_tok, l_tok)
+            pairs.append((-sim, i, j, soft))
+    pairs.sort()
+
+    used_short: Set[int] = set()
+    used_long: Set[int] = set()
+    statuses: List[str] = []
+    for neg_sim, i, j, soft in pairs:
+        if i in used_short or j in used_long:
+            continue
+        used_short.add(i)
+        used_long.add(j)
+        sim = -neg_sim
+        if sim >= 0.80:
+            statuses.append("strong")
+        elif soft:
+            statuses.append("soft")
+        elif sim <= 0.5:
+            statuses.append("none")
+        else:
+            statuses.append("weak")
+
+    matched = [s for s in statuses if s in ("strong", "soft")]
+    if all(s == "strong" for s in statuses):
+        return "same"
+    if len(matched) == len(statuses) and "soft" in statuses:
+        return "possible"
+    if matched and "none" in statuses:
+        return "conflict"
+    return "unknown"
+
+
 class GraphMemoryManager:
     """
     Central Blackboard / Memory Manager for Layer 3 extraction.
@@ -228,7 +308,7 @@ class GraphMemoryManager:
     def clean_person_name(self, name: str) -> str:
         """Strip common honorifics and titles from person names."""
         norm = self._normalize(name)
-        return re.sub(r"^(dr\.?|mr\.?|mrs\.?|ms\.?|prof\.?|surgeon:?|md|esq\.?)\s+", "", norm).strip()
+        return re.sub(r"^(?:dr|mr|mrs|ms|prof|surgeon:?|md|esq)(?:\.\s*|\s+)", "", norm).strip()
 
     @property
     def merge_ledger(self) -> List[MergeAuditRecord]:
@@ -372,20 +452,10 @@ class GraphMemoryManager:
         incoming_person = self._normalize(incoming.type) in CLUSTER_PERSON
         candidate_person = self._normalize(candidate.type) in CLUSTER_PERSON
         if not is_alias_match and (incoming_person or candidate_person):
-            clean_in = self.clean_person_name(incoming.value)
-            clean_cand = self.clean_person_name(candidate.value)
-            if clean_in and clean_cand:
-                tokens_in = [t for t in clean_in.split() if len(t) > 0]
-                tokens_cand = [t for t in clean_cand.split() if len(t) > 0]
-                if len(tokens_in) >= 2 and len(tokens_cand) >= 2:
-                    t_in_0 = tokens_in[0].rstrip(".")
-                    t_cand_0 = tokens_cand[0].rstrip(".")
-                    # An initial matching the first letter (e.g. "A." vs "Arun") is compatible
-                    is_initial = (len(t_in_0) == 1 or len(t_cand_0) == 1) and (t_in_0[0] == t_cand_0[0])
-                    if not is_initial and t_in_0 != t_cand_0:
-                        reasons.append(
-                            f"CONFLICTING_PERSON_NAMES: first name '{tokens_in[0]}' != '{tokens_cand[0]}' in '{clean_in}' vs '{clean_cand}'"
-                        )
+            if _person_name_relation(incoming.value, candidate.value) == "conflict":
+                reasons.append(
+                    f"CONFLICTING_PERSON_NAMES: '{self.clean_person_name(incoming.value)}' vs '{self.clean_person_name(candidate.value)}'"
+                )
 
         return (len(reasons) > 0, reasons)
 
@@ -606,6 +676,13 @@ class GraphMemoryManager:
         val_cand = self._normalize(candidate.value)
         signals: List[str] = []
         score = 0.0
+        skip_type_bonus = False
+
+        is_person_pair = (
+            self._normalize(incoming.type) in CLUSTER_PERSON
+            or self._normalize(candidate.type) in CLUSTER_PERSON
+        )
+        name_relation = _person_name_relation(incoming.value, candidate.value) if is_person_pair else "unknown"
 
         # Exact normalized match
         if val_in == val_cand:
@@ -622,6 +699,15 @@ class GraphMemoryManager:
         elif self.clean_person_name(incoming.value) == self.clean_person_name(candidate.value) and len(self.clean_person_name(incoming.value)) > 3:
             score = 0.90
             signals.append("NORMALIZED_NAME_MATCH")
+        # Person names that match token-by-token (order, initials, OCR typos)
+        elif name_relation == "same":
+            score = 0.90
+            signals.append("NORMALIZED_NAME_MATCH_FUZZY")
+        elif name_relation == "possible":
+            # Kept at 0.80 (below match_threshold): the exact-type bonus is skipped for this branch
+            score = 0.80
+            signals.append("NAME_PREFIX_POSSIBLE")
+            skip_type_bonus = True
         # Substring / containment match
         elif (val_in in val_cand or val_cand in val_in) and min(len(val_in), len(val_cand)) > 3:
             score = 0.75
@@ -643,12 +729,17 @@ class GraphMemoryManager:
                     signals.append(f"TOKEN_OVERLAP_{round(jaccard, 2)}")
 
         # Signal boost: LLM suggested this node as candidate
-        if proposed_reused_id and candidate.id == proposed_reused_id:
+        # A "possible" name pair must never reach match_threshold through the LLM boost.
+        if (
+            proposed_reused_id
+            and candidate.id == proposed_reused_id
+            and "NAME_PREFIX_POSSIBLE" not in signals
+        ):
             score = min(1.0, score + 0.05)
             signals.append("LLM_PROPOSED_REUSE")
 
         # Signal boost: Exact type match
-        if self._normalize(incoming.type) == self._normalize(candidate.type):
+        if not skip_type_bonus and self._normalize(incoming.type) == self._normalize(candidate.type):
             score = min(1.0, score + 0.05)
             signals.append("EXACT_TYPE_MATCH")
 

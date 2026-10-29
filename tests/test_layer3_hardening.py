@@ -32,6 +32,7 @@ from src.ai.layer3_extraction.graph_agent.memory_manager import (
     GraphMemoryManager,
     PageDelta,
     UnresolvedRef,
+    _person_name_relation,
 )
 from src.ai.layer3_extraction.graph_agent.models import (
     Evidence,
@@ -1492,5 +1493,99 @@ async def test_relationship_endpoint_unsafe_search_fallback_removed():
     canon_edges = manager.graph.get_edges(source_node="p2_doc1", target_node="hosp_apollo", relationship="CONSULTANT_AT")
     assert len(canon_edges) == 1
     assert canon_edges[0].source_page == 2
+
+
+# ==============================================================================
+# 5. PERSON NAME RELATION (entity resolution false-block fixes)
+# ==============================================================================
+
+@pytest.mark.parametrize("a,b", [
+    ("MRS CHANDER KOCHHAR", "KOCHHAR CHANDER"),
+    ("CHANDER KOCHHAR", "CHANDAR KOCHHAR"),
+    ("ABHAY RAUT", "RAUT ABHAY"),
+    ("ABHAY RAUT", "DR.ABHAY RAUT"),
+    ("Robert Smith", "Robert James Smith"),
+    ("A. Sharma", "Arun Sharma"),
+])
+def test_person_name_relation_same(a, b):
+    assert _person_name_relation(a, b) == "same"
+    assert _person_name_relation(b, a) == "same"
+
+
+@pytest.mark.parametrize("a,b", [
+    ("Dr lancelot Pinto", "Dr. Lance Pinto"),
+])
+def test_person_name_relation_possible(a, b):
+    assert _person_name_relation(a, b) == "possible"
+    assert _person_name_relation(b, a) == "possible"
+
+
+@pytest.mark.parametrize("a,b", [
+    ("Chander Kochhar", "Manu Kochhar"),
+    ("Arun Sharma", "Ramesh Sharma"),
+    ("John Smith", "Jane Smith"),
+])
+def test_person_name_relation_conflict(a, b):
+    assert _person_name_relation(a, b) == "conflict"
+    assert _person_name_relation(b, a) == "conflict"
+
+
+@pytest.mark.parametrize("a,b", [
+    ("Kochhar", "Chander Kochhar"),
+])
+def test_person_name_relation_unknown(a, b):
+    assert _person_name_relation(a, b) == "unknown"
+
+
+def test_person_name_possible_pair_scores_below_match_threshold():
+    manager = GraphMemoryManager()
+    incoming = GraphNode(id="inc_pn", type="Person", label="person_name",
+                         value="Dr lancelot Pinto", source_pages=[2])
+    candidate = GraphNode(id="cand_pn", type="Person", label="person_name",
+                          value="Dr. Lance Pinto", source_pages=[1])
+    score, signals = manager.score_candidate(incoming, candidate)
+    assert score == 0.80
+    assert signals == ["NAME_PREFIX_POSSIBLE"]
+    assert score < manager.match_threshold
+
+
+def test_person_name_reuse_boost_respects_possible_threshold():
+    manager = GraphMemoryManager()
+    # "possible" pair with an LLM reuse proposal must stay below match_threshold
+    possible_in = GraphNode(id="pr_in", type="Person", label="person_name",
+                            value="Dr lancelot Pinto", source_pages=[2])
+    possible_cand = GraphNode(id="pr_cand", type="Person", label="person_name",
+                              value="Dr. Lance Pinto", source_pages=[1])
+    p_score, p_signals = manager.score_candidate(possible_in, possible_cand, proposed_reused_id="pr_cand")
+    assert p_score == 0.80
+    assert "LLM_PROPOSED_REUSE" not in p_signals
+    assert p_score < manager.match_threshold
+
+    # "same" pair with the same proposal still receives the boost, capped at 1.0
+    same_in = GraphNode(id="sr_in", type="Person", label="person_name",
+                        value="CHANDER KOCHHAR", source_pages=[2])
+    same_cand = GraphNode(id="sr_cand", type="Person", label="person_name",
+                          value="CHANDAR KOCHHAR", source_pages=[1])
+    s_score, s_signals = manager.score_candidate(same_in, same_cand, proposed_reused_id="sr_cand")
+    assert "NORMALIZED_NAME_MATCH_FUZZY" in s_signals
+    assert "LLM_PROPOSED_REUSE" in s_signals
+    assert s_score == 1.0
+
+
+def test_person_name_contradiction_gate_order_and_conflict():
+    manager = GraphMemoryManager()
+    surname_first_in = GraphNode(id="sf_in", type="Person", label="person_name",
+                                 value="KOCHHAR CHANDER", source_pages=[1])
+    surname_first_cand = GraphNode(id="sf_cand", type="Person", label="person_name",
+                                   value="CHANDER KOCHHAR", source_pages=[2])
+    blocked, reasons = manager.check_hard_contradictions(surname_first_in, surname_first_cand)
+    assert not blocked, reasons
+
+    other_in = GraphNode(id="o_in", type="Person", label="person_name",
+                         value="Manu Kochhar", source_pages=[1])
+    other_cand = GraphNode(id="o_cand", type="Person", label="person_name",
+                           value="Chander Kochhar", source_pages=[2])
+    blocked2, reasons2 = manager.check_hard_contradictions(other_in, other_cand)
+    assert blocked2 and any("CONFLICTING_PERSON_NAMES" in r for r in reasons2), reasons2
 
 
