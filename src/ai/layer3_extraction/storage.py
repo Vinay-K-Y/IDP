@@ -30,6 +30,8 @@ from sqlalchemy import (
     Text,
     JSON,
     create_engine,
+    exists,
+    func,
     UniqueConstraint,
     Index,
 )
@@ -482,6 +484,94 @@ def get_markdown_record(doc_id: str, owner: str) -> Optional[dict]:
     except Exception as exc:
         logger.error("storage.get_markdown_failed", owner=owner, doc_id=doc_id, error=str(exc))
         return None
+
+
+def _ocr_doc_query(session, owner: Optional[str], with_markdown: bool = False):
+    """
+    Query for OCR'd documents. Selects metadata only, so the list never loads
+    markdown text. with_markdown=True adds the text for the single-document view.
+    All values are bound parameters.
+    """
+    graph_exists = exists().where(
+        DocumentGraphRecord.owner == MarkdownRecord.owner,
+        DocumentGraphRecord.doc_id == MarkdownRecord.doc_id,
+    )
+    extraction_exists = exists().where(
+        ExtractionRun.owner == MarkdownRecord.owner,
+        ExtractionRun.doc_id == MarkdownRecord.doc_id,
+    )
+    columns = [
+        MarkdownRecord.id,
+        MarkdownRecord.owner,
+        MarkdownRecord.doc_id,
+        MarkdownRecord.md_filename,
+        MarkdownRecord.page_count,
+        MarkdownRecord.schema_id,
+        MarkdownRecord.created_at,
+        func.length(MarkdownRecord.markdown_content).label("size_chars"),
+        graph_exists.label("has_graph"),
+        extraction_exists.label("has_extraction"),
+    ]
+    if with_markdown:
+        columns += [MarkdownRecord.markdown_content, MarkdownRecord.schema_ref_json]
+    q = session.query(*columns)
+    if owner is not None:
+        q = q.filter(MarkdownRecord.owner == owner)
+    return q
+
+
+def _ocr_doc_row_to_dict(r) -> dict:
+    out = {
+        "id": r.id,
+        "doc_id": r.doc_id,
+        "md_filename": r.md_filename or f"{r.doc_id}.md",
+        "owner": r.owner,
+        "page_count": r.page_count,
+        "size_chars": int(r.size_chars or 0),
+        "created_at": r.created_at.isoformat() if r.created_at else None,
+        "schema_id": r.schema_id,
+        "has_graph": bool(r.has_graph),
+        "has_extraction": bool(r.has_extraction),
+    }
+    if hasattr(r, "markdown_content"):
+        out["markdown_content"] = r.markdown_content or ""
+        out["schema_ref_json"] = r.schema_ref_json
+    return out
+
+
+def list_ocr_document_summaries(owner: Optional[str] = None, limit: int = 200) -> List[dict]:
+    """
+    OCR'd documents stored in document_markdowns, newest first, without markdown text.
+    owner=None returns every owner (admin only; the caller enforces that).
+    DB errors propagate so the API can report them instead of showing an empty list.
+    """
+    init_db()
+    session = SessionLocal()
+    try:
+        rows = (
+            _ocr_doc_query(session, owner)
+            .order_by(MarkdownRecord.created_at.desc(), MarkdownRecord.id.desc())
+            .limit(int(limit))
+            .all()
+        )
+        return [_ocr_doc_row_to_dict(r) for r in rows]
+    finally:
+        session.close()
+
+
+def get_ocr_document_records(doc_id: str, owner: Optional[str] = None) -> List[dict]:
+    """
+    Full OCR'd document rows for an exact doc_id, including markdown_content.
+    Returns every match, so the caller can detect an ambiguous lookup across owners.
+    """
+    init_db()
+    session = SessionLocal()
+    try:
+        q = _ocr_doc_query(session, owner, with_markdown=True).filter(MarkdownRecord.doc_id == doc_id)
+        rows = q.order_by(MarkdownRecord.created_at.desc(), MarkdownRecord.id.desc()).all()
+        return [_ocr_doc_row_to_dict(r) for r in rows]
+    finally:
+        session.close()
 
 
 def save_extraction_run(

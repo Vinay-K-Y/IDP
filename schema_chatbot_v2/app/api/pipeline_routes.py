@@ -15,11 +15,12 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
 import pymupdf
-from fastapi import APIRouter, Depends, File, Form, HTTPException, Response, UploadFile
+from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, Response, UploadFile
 from PIL import Image
 
 from app.core.activity_log import log_activity
 from app.core.auth import get_current_user, require_admin
+from app.core.job_progress import JobProgressTracker, compact_progress, progress_view
 from app.storage.user_store import User
 
 ROOT = Path(__file__).resolve().parents[3]
@@ -49,6 +50,7 @@ class JobControl:
         self.pause_event = threading.Event()
         self.pause_event.set()  # set = running; cleared = paused
         self.kill_event = threading.Event()  # set = kill requested
+        self.progress = JobProgressTracker()  # page-level OCR progress for this job
 
 
 _pipeline_jobs: Dict[str, Dict[str, Any]] = {}
@@ -321,6 +323,95 @@ def download_output(name: str, owner: Optional[str] = None, _: User = Depends(re
 # ========================= Schemas =========================
 
 
+OCR_DOC_ID_MAX_LEN = 255
+OCR_DOC_LIST_MAX = 500
+
+
+def validate_ocr_doc_id(doc_id: str) -> str:
+    """
+    Accepts one plain filename ending in .pdf or .md. Rejects path separators,
+    '..', NUL, hidden names and over-long values, all with HTTP 400.
+    The value is only ever used as a database filter, never as a file path.
+    """
+    if not doc_id or not isinstance(doc_id, str) or len(doc_id) > OCR_DOC_ID_MAX_LEN:
+        raise HTTPException(status_code=400, detail="Invalid doc_id.")
+    if "\x00" in doc_id or "/" in doc_id or "\\" in doc_id or ".." in doc_id or doc_id.startswith("."):
+        raise HTTPException(status_code=400, detail="Invalid doc_id: must be a plain filename.")
+    if Path(doc_id).name != doc_id:
+        raise HTTPException(status_code=400, detail="Invalid doc_id: must be a plain filename.")
+    if not doc_id.lower().endswith((".pdf", ".md")):
+        raise HTTPException(status_code=400, detail="Invalid doc_id: must end with .pdf or .md.")
+    return doc_id
+
+
+def normalize_ocr_owner(owner: Optional[str]) -> Optional[str]:
+    """An empty owner filter means 'no filter'. The value is only compared in SQL."""
+    if owner is None:
+        return None
+    owner = owner.strip()
+    return owner or None
+
+
+def pick_single_ocr_row(rows: List[Dict[str, Any]], doc_id: str) -> Dict[str, Any]:
+    """One document row, or 404 when none matches and 400 when several owners share the doc_id."""
+    if not rows:
+        raise HTTPException(status_code=404, detail=f"No OCR document '{doc_id}' found.")
+    if len(rows) > 1:
+        owners = sorted({r["owner"] for r in rows})
+        raise HTTPException(
+            status_code=400,
+            detail=f"Ambiguous doc_id '{doc_id}' found for multiple owners: {owners}. Specify owner.",
+        )
+    return rows[0]
+
+
+def ocr_markdown_attachment(row: Dict[str, Any]) -> Response:
+    """Markdown download. The filename is reduced to a safe ASCII form before it goes in the header."""
+    safe_name = re.sub(r"[^A-Za-z0-9._-]", "_", row["md_filename"] or "document.md")
+    if not safe_name.lower().endswith(".md"):
+        safe_name = f"{safe_name}.md"
+    return Response(
+        content=(row["markdown_content"] or "").encode("utf-8"),
+        media_type="text/markdown; charset=utf-8",
+        headers={"Content-Disposition": f'attachment; filename="{safe_name}"'},
+    )
+
+
+def ocr_list_payload(items: List[Dict[str, Any]], limit: int) -> Dict[str, Any]:
+    """Trim a list that was fetched with limit + 1 rows, so the caller can tell when more exist."""
+    truncated = len(items) > limit
+    docs = items[:limit]
+    return {"documents": docs, "count": len(docs), "truncated": truncated}
+
+
+@router.get("/documents/ocr")
+def list_ocr_documents(
+    owner: Optional[str] = None,
+    limit: int = Query(200, ge=1, le=OCR_DOC_LIST_MAX),
+    _: User = Depends(require_admin),
+) -> Dict[str, Any]:
+    """OCR'd documents from document_markdowns, all owners. owner filters to one owner."""
+    from src.ai.layer3_extraction.storage import list_ocr_document_summaries
+    items = list_ocr_document_summaries(owner=normalize_ocr_owner(owner), limit=limit + 1)
+    return ocr_list_payload(items, limit)
+
+
+@router.get("/documents/ocr/{doc_id}")
+def get_ocr_document(doc_id: str, owner: Optional[str] = None, _: User = Depends(require_admin)) -> Dict[str, Any]:
+    from src.ai.layer3_extraction.storage import get_ocr_document_records
+    validate_ocr_doc_id(doc_id)
+    rows = get_ocr_document_records(doc_id, owner=normalize_ocr_owner(owner))
+    return pick_single_ocr_row(rows, doc_id)
+
+
+@router.get("/documents/ocr/{doc_id}/markdown", response_class=Response)
+def download_ocr_markdown(doc_id: str, owner: Optional[str] = None, _: User = Depends(require_admin)) -> Response:
+    from src.ai.layer3_extraction.storage import get_ocr_document_records
+    validate_ocr_doc_id(doc_id)
+    rows = get_ocr_document_records(doc_id, owner=normalize_ocr_owner(owner))
+    return ocr_markdown_attachment(pick_single_ocr_row(rows, doc_id))
+
+
 @router.get("/schemas")
 def list_schemas(_: User = Depends(require_admin)) -> Dict[str, Any]:
     # DB-backed: schemas are read from the PostgreSQL `schemas` table, not disk.
@@ -370,17 +461,25 @@ def pipeline_status(_: User = Depends(require_admin)) -> Dict[str, Any]:
                 "created_at": v["created_at"],
                 "total": len(v.get("targets", [])),
                 "completed": len(v.get("successes", [])) + len(v.get("failures", [])),
+                "progress": compact_progress(_job_progress(k, v)),
             }
             for k, v in _pipeline_jobs.items()
         },
     }
 
 
+def _job_progress(job_id: str, job: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """Live page-level progress for a job, or None for a job with no tracker."""
+    ctrl = _job_controls.get(job_id)
+    return progress_view(job, ctrl.progress if ctrl else None)
+
+
 @router.get("/pipeline/jobs/{job_id}")
 def get_pipeline_job(job_id: str, _: User = Depends(require_admin)) -> Dict[str, Any]:
     if job_id not in _pipeline_jobs:
         raise HTTPException(status_code=404, detail="job not found")
-    return _pipeline_jobs[job_id]
+    job = _pipeline_jobs[job_id]
+    return {**job, "progress": _job_progress(job_id, job)}
 
 
 @router.post("/pipeline/jobs/{job_id}/pause")
@@ -396,6 +495,7 @@ def pause_pipeline_job(job_id: str, admin: User = Depends(require_admin)) -> Dic
     ctrl = _job_controls.get(job_id)
     if ctrl:
         ctrl.pause_event.clear()
+        ctrl.progress.pause()
     job["status"] = "paused"
     logger.info("pipeline.job_paused", job_id=job_id)
     log_activity(admin.username, "job_paused", {"job_id": job_id})
@@ -415,6 +515,7 @@ def resume_pipeline_job(job_id: str, admin: User = Depends(require_admin)) -> Di
     ctrl = _job_controls.get(job_id)
     if ctrl:
         ctrl.pause_event.set()
+        ctrl.progress.resume()
     job["status"] = "running"
     logger.info("pipeline.job_resumed", job_id=job_id)
     log_activity(admin.username, "job_resumed", {"job_id": job_id})
@@ -435,6 +536,7 @@ def kill_pipeline_job(job_id: str, admin: User = Depends(require_admin)) -> Dict
     if ctrl:
         ctrl.kill_event.set()
         ctrl.pause_event.set()  # Unblock thread if it was paused
+        ctrl.progress.kill_requested()
     job["status"] = "killed"
     if not job.get("finished_at"):
         job["finished_at"] = datetime.now().astimezone().isoformat(timespec="seconds")
@@ -564,6 +666,7 @@ async def run_pipeline(
     }
     _pipeline_jobs[job_id] = job
     _job_controls[job_id] = JobControl()
+    _job_controls[job_id].progress.attach(job)
 
     thread = threading.Thread(
         target=_run_pipeline_job,
@@ -596,6 +699,18 @@ def _parse_pages_from_markdown(md_text: str) -> List[Dict[str, Any]]:
     return pages
 
 
+def _planned_page_counts(targets: List[Path]) -> List[int]:
+    """Page count of each target, read from PDF metadata only (no rendering)."""
+    counts: List[int] = []
+    for pdf in targets:
+        try:
+            with pymupdf.open(pdf) as doc:
+                counts.append(doc.page_count)
+        except Exception:
+            counts.append(0)  # fails later, as it does today
+    return counts
+
+
 def _run_pipeline_job(
     job_id: str,
     targets: List[Path],
@@ -616,6 +731,8 @@ def _run_pipeline_job(
     job["owner"] = job_owner
     job["status"] = "running"
     job["started_at"] = datetime.now().astimezone().isoformat(timespec="seconds")
+    ctrl.progress.attach(job)
+    ctrl.progress.start_job(_planned_page_counts(targets))
 
     try:
         from src.adapters.llm.factory import get_llm_client
@@ -631,6 +748,7 @@ def _run_pipeline_job(
         while not ctrl.kill_event.is_set():
             if ctrl.pause_event.is_set():
                 break
+            ctrl.progress.mark_waiting()  # parked for a pause: the job is now 'paused', not 'pausing'
             time.sleep(0.2)
 
         if ctrl.kill_event.is_set():
@@ -638,8 +756,10 @@ def _run_pipeline_job(
             job["status"] = "killed"
             job["finished_at"] = datetime.now().astimezone().isoformat(timespec="seconds")
             job["wall_time_s"] = round(time.monotonic() - t_start, 2)
+            ctrl.progress.finish("killed")
             return
 
+        ctrl.progress.start_doc(pdf.name)
         owner = job.get("owner")
         job_out_dir = resolve_owner_output_dir(owner) if owner else OUTPUT_DIR
         job_out_dir.mkdir(parents=True, exist_ok=True)
@@ -676,6 +796,7 @@ def _run_pipeline_job(
             results = None
             try:
                 pages = _build_pages_for_pdf(pdf)
+                ctrl.progress.begin_ocr(len(pages))
                 results = process_document(
                     pages=pages,
                     llm_client=llm_client,
@@ -685,11 +806,15 @@ def _run_pipeline_job(
                     output_dir=str(job_out_dir),
                     overwrite=True,
                     ir_owner=job_owner,
+                    on_page_complete=ctrl.progress.page_done,
                 )
             except Exception as proc_exc:
                 logger.warning("pipeline.process_document_failed", pdf=pdf.name, error=str(proc_exc))
                 if not existing_md_text:
                     raise
+
+            # OCR is done. The OCR timer stops here, so the saving below is not counted as OCR.
+            ctrl.progress.finish_ocr()
 
             # Persist DocumentIR per owner (doc_id == full filename, matching the
             # Query Bot / graph store doc_id). Never fails the job; records a flag.
@@ -773,11 +898,13 @@ def _run_pipeline_job(
                 encoding="utf-8",
             )
 
-            # Persist converted Markdown (.md) into PostgreSQL document_markdowns table
+            # Persist converted Markdown (.md) into PostgreSQL document_markdowns table.
+            # The return value is the row id, or None when the save failed. A failed save does not fail the job.
+            md_db_record_id = None
             try:
                 from src.ai.layer3_extraction.storage import save_markdown_record
                 md_text = md_path.read_text(encoding="utf-8") if md_path.exists() else ""
-                save_markdown_record(
+                md_db_record_id = save_markdown_record(
                     doc_id=pdf.name,
                     md_filename=md_path.name,
                     markdown_content=md_text,
@@ -788,7 +915,7 @@ def _run_pipeline_job(
                     pages_json=pages_for_layer3,
                 )
             except Exception:
-                pass
+                md_db_record_id = None
 
             elapsed = time.monotonic() - t0
 
@@ -819,17 +946,28 @@ def _run_pipeline_job(
                     t_ext0 = time.monotonic()
                     extraction_llm = get_extraction_client()
 
-                    extracted_result = extract_with_retry(
-                        lambda: extract_document(
-                            pages_for_layer3,
+                    # Graph strategies build the knowledge graph inside extract_document, so that
+                    # call gets its own graph timer. Other strategies only extract fields.
+                    is_graph_strategy = str(selected_strategy or "").startswith("graph_memory")
+                    if is_graph_strategy:
+                        ctrl.progress.begin_graph()
+                    else:
+                        ctrl.progress.begin_extract()
+                    try:
+                        extracted_result = extract_with_retry(
+                            lambda: extract_document(
+                                pages_for_layer3,
+                                dynamic_schema,
+                                extraction_llm,
+                                strategy=selected_strategy,
+                                graph_out=graph_meta,
+                                owner=job_owner,
+                            ),
                             dynamic_schema,
-                            extraction_llm,
-                            strategy=selected_strategy,
-                            graph_out=graph_meta,
-                            owner=job_owner,
-                        ),
-                        dynamic_schema,
-                    )
+                        )
+                    finally:
+                        if is_graph_strategy:
+                            ctrl.progress.finish_graph()
                     extract_elapsed = round(time.monotonic() - t_ext0, 2)
                     extracted_data = extracted_result.model_dump()
 
@@ -913,6 +1051,9 @@ def _run_pipeline_job(
                 "db_run_id": db_id,
                 "db_error": db_error,
                 "ir_persisted": ir_persisted,
+                "md_db_saved": md_db_record_id is not None,
+                "md_db_record_id": md_db_record_id,
+                **ctrl.progress.doc_timing(),
             })
         except Exception as exc:
             logger.error("pipeline.doc_failed", pdf=pdf.name, error=str(exc), error_type=type(exc).__name__)
@@ -921,7 +1062,10 @@ def _run_pipeline_job(
                 "error_type": type(exc).__name__,
                 "error": str(exc),
                 "elapsed_s": round(time.monotonic() - t0, 2),
+                **ctrl.progress.doc_timing(),
             })
+
+        ctrl.progress.finish_doc()
 
         # Check after PDF completed if kill was requested during doc processing
         if ctrl.kill_event.is_set():
@@ -929,12 +1073,15 @@ def _run_pipeline_job(
             job["status"] = "killed"
             job["finished_at"] = datetime.now().astimezone().isoformat(timespec="seconds")
             job["wall_time_s"] = round(time.monotonic() - t_start, 2)
+            ctrl.progress.finish("killed")
             return
 
     if ctrl.kill_event.is_set():
         job["status"] = "killed"
+        ctrl.progress.finish("killed")
     else:
         job["status"] = "completed"
+        ctrl.progress.finish("finished")
     job["finished_at"] = datetime.now().astimezone().isoformat(timespec="seconds")
     job["wall_time_s"] = round(time.monotonic() - t_start, 2)
 

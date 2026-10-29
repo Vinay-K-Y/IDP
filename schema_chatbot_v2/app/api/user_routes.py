@@ -12,19 +12,25 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
-from fastapi import APIRouter, Depends, File, Form, HTTPException, Response, UploadFile
+from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, Response, UploadFile
 
 from app.api.pipeline_routes import (
     DATASET_DIR,
+    OCR_DOC_LIST_MAX,
     SCHEMA_REGISTRY,
     JobControl,
     _job_controls,
     _pipeline_jobs,
     _run_pipeline_job,
     download_job_pdf_report,
+    ocr_list_payload,
+    ocr_markdown_attachment,
+    pick_single_ocr_row,
+    validate_ocr_doc_id,
 )
 from app.core.activity_log import log_activity
 from app.core.auth import get_current_user
+from app.core.job_progress import compact_progress, progress_view
 from app.storage.user_store import User
 from src.config.settings import settings as a_settings
 from src.utils.logger import get_logger
@@ -271,6 +277,7 @@ async def run_my_pipeline(
         "current_document": None,
     }
     _job_controls[job_id] = JobControl()
+    _job_controls[job_id].progress.attach(_pipeline_jobs[job_id])
 
     thread = threading.Thread(
         target=_run_pipeline_job,
@@ -305,6 +312,7 @@ def my_pipeline_status(user: User = Depends(get_current_user)) -> Dict[str, Any]
                 "remaining": remaining,
                 "total": total,
                 "created_at": v.get("created_at"),
+                "progress": compact_progress(_job_progress_view(k, v)),
             })
     return {"jobs": user_jobs}
 
@@ -322,6 +330,7 @@ def pause_my_pipeline_job(job_id: str, user: User = Depends(get_current_user)) -
     ctrl = _job_controls.get(job_id)
     if ctrl:
         ctrl.pause_event.clear()
+        ctrl.progress.pause()
     job["status"] = "paused"
     logger.info("pipeline.user_job_paused", job_id=job_id, username=user.username)
     log_activity(user.username, "job_paused", {"job_id": job_id})
@@ -341,6 +350,7 @@ def resume_my_pipeline_job(job_id: str, user: User = Depends(get_current_user)) 
     ctrl = _job_controls.get(job_id)
     if ctrl:
         ctrl.pause_event.set()
+        ctrl.progress.resume()
     job["status"] = "running"
     logger.info("pipeline.user_job_resumed", job_id=job_id, username=user.username)
     log_activity(user.username, "job_resumed", {"job_id": job_id})
@@ -361,6 +371,7 @@ def kill_my_pipeline_job(job_id: str, user: User = Depends(get_current_user)) ->
     if ctrl:
         ctrl.kill_event.set()
         ctrl.pause_event.set()
+        ctrl.progress.kill_requested()
     job["status"] = "killed"
     if not job.get("finished_at"):
         job["finished_at"] = datetime.now().astimezone().isoformat(timespec="seconds")
@@ -374,7 +385,41 @@ def get_my_pipeline_job(job_id: str, user: User = Depends(get_current_user)) -> 
     job = _pipeline_jobs.get(job_id)
     if not job or job.get("owner") != user.username:
         raise HTTPException(status_code=404, detail="job not found")
-    return job
+    return {**job, "progress": _job_progress_view(job_id, job)}
+
+
+def _job_progress_view(job_id: str, job: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """Live page-level progress for a job, or None for a job with no tracker."""
+    ctrl = _job_controls.get(job_id)
+    return progress_view(job, ctrl.progress if ctrl else None)
+
+
+@router.get("/ocr-documents")
+def list_my_ocr_documents(
+    limit: int = Query(200, ge=1, le=OCR_DOC_LIST_MAX),
+    user: User = Depends(get_current_user),
+) -> Dict[str, Any]:
+    """OCR'd documents owned by the caller. The owner is the caller's username, never a request parameter."""
+    from src.ai.layer3_extraction.storage import list_ocr_document_summaries
+    items = list_ocr_document_summaries(owner=user.username, limit=limit + 1)
+    return ocr_list_payload(items, limit)
+
+
+@router.get("/ocr-documents/{doc_id}")
+def get_my_ocr_document(doc_id: str, user: User = Depends(get_current_user)) -> Dict[str, Any]:
+    from src.ai.layer3_extraction.storage import get_ocr_document_records
+    validate_ocr_doc_id(doc_id)
+    # Another user's document is filtered out by owner, so it returns 404 and does not reveal that it exists.
+    rows = get_ocr_document_records(doc_id, owner=user.username)
+    return pick_single_ocr_row(rows, doc_id)
+
+
+@router.get("/ocr-documents/{doc_id}/markdown", response_class=Response)
+def download_my_ocr_markdown(doc_id: str, user: User = Depends(get_current_user)) -> Response:
+    from src.ai.layer3_extraction.storage import get_ocr_document_records
+    validate_ocr_doc_id(doc_id)
+    rows = get_ocr_document_records(doc_id, owner=user.username)
+    return ocr_markdown_attachment(pick_single_ocr_row(rows, doc_id))
 
 
 @router.get("/pipeline/jobs/{job_id}/pdf", response_class=Response)

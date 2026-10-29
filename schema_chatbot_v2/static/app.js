@@ -285,6 +285,8 @@
             if ($('outCount')) $('outCount').textContent = outs.length;
             renderDocList(state.docs, outs);
             renderDocChecklist();
+            loadOcrDocs('admin');
+            loadOcrOwnerOptions();
         } catch (e) {
             if ($('docList')) $('docList').innerHTML = `<p class="muted">Failed to load: ${e.message}</p>`;
         }
@@ -371,6 +373,213 @@
         }
     }
 
+    // ======================= OCR Documents (Shared Dataset and My Documents) =======================
+
+    // One table builder serves both the admin view (all owners) and the user view (own documents).
+    // Names, text and owners are set with textContent or created with createElement, never innerHTML.
+    const OCR_SCOPES = {
+        admin: { prefix: 'ocr', base: '/documents/ocr', showOwner: true },
+        user: { prefix: 'userOcr', base: '/me/ocr-documents', showOwner: false },
+    };
+    let ocrViewerSeq = 0; // a newer View click makes older responses stale
+
+    function ocrEl(scope, suffix) {
+        return $(OCR_SCOPES[scope].prefix + suffix);
+    }
+
+    function setOcrState(scope, message, isError = false) {
+        const node = ocrEl(scope, 'State');
+        if (!node) return;
+        node.textContent = message || '';
+        node.classList.toggle('is-error', isError);
+        node.classList.toggle('hidden', !message);
+    }
+
+    function ocrDocUrl(scope, doc, suffix = '') {
+        let url = `${OCR_SCOPES[scope].base}/${encodeURIComponent(doc.doc_id)}${suffix}`;
+        if (scope === 'admin') url += `?owner=${encodeURIComponent(doc.owner)}`;
+        return url;
+    }
+
+    function fmtSavedAt(iso) {
+        if (!iso) return '--';
+        const d = new Date(iso);
+        return Number.isNaN(d.getTime()) ? '--' : d.toLocaleString();
+    }
+
+    function ocrCell(text, className) {
+        const td = document.createElement('td');
+        if (className) td.className = className;
+        td.textContent = text;
+        return td;
+    }
+
+    function ocrBadge(text, className) {
+        const span = document.createElement('span');
+        span.className = `badge ${className}`;
+        span.textContent = text;
+        return span;
+    }
+
+    function ocrRow(scope, doc) {
+        const tr = document.createElement('tr');
+
+        const nameTd = document.createElement('td');
+        const name = document.createElement('div');
+        name.className = 'doc-name';
+        name.textContent = doc.doc_id;
+        const mdLine = document.createElement('div');
+        mdLine.className = 'doc-meta';
+        mdLine.textContent = doc.md_filename;
+        nameTd.append(name, mdLine);
+        tr.appendChild(nameTd);
+
+        if (OCR_SCOPES[scope].showOwner) tr.appendChild(ocrCell(doc.owner || '--', 'ocr-col-owner'));
+        tr.appendChild(ocrCell(doc.page_count ?? '--', 'ocr-col-num'));
+        const size = Number.isFinite(doc.size_chars) ? `${doc.size_chars.toLocaleString()} chars` : '--';
+        tr.appendChild(ocrCell(size, 'ocr-col-num'));
+        tr.appendChild(ocrCell(fmtSavedAt(doc.created_at), 'ocr-col-saved'));
+
+        const storedTd = document.createElement('td');
+        storedTd.className = 'ocr-col-stored';
+        if (doc.has_graph) storedTd.appendChild(ocrBadge('Graph', 'badge-primary'));
+        if (doc.has_extraction) storedTd.appendChild(ocrBadge('Extraction', 'badge-info'));
+        if (!doc.has_graph && !doc.has_extraction) storedTd.appendChild(ocrBadge('Text only', 'badge-mute'));
+        tr.appendChild(storedTd);
+
+        const actTd = document.createElement('td');
+        actTd.className = 'ocr-col-actions';
+        const viewBtn = document.createElement('button');
+        viewBtn.type = 'button';
+        viewBtn.className = 'btn btn-ghost btn-sm';
+        viewBtn.textContent = 'View';
+        viewBtn.setAttribute('aria-label', `View ${doc.doc_id}`);
+        viewBtn.addEventListener('click', () => viewOcrDocument(scope, doc));
+        const dlBtn = document.createElement('button');
+        dlBtn.type = 'button';
+        dlBtn.className = 'btn btn-outline btn-sm';
+        dlBtn.textContent = 'Download .md';
+        dlBtn.setAttribute('aria-label', `Download ${doc.md_filename}`);
+        dlBtn.addEventListener('click', () => downloadOcrDocument(scope, doc));
+        actTd.append(viewBtn, dlBtn);
+        tr.appendChild(actTd);
+        return tr;
+    }
+
+    function ensureOwnerOption(select, name) {
+        if (!name || [...select.options].some((o) => o.value === name)) return;
+        const opt = document.createElement('option');
+        opt.value = name;
+        opt.textContent = name;
+        select.appendChild(opt);
+    }
+
+    function renderOcrTable(scope, docs) {
+        const body = ocrEl(scope, 'Body');
+        const wrap = ocrEl(scope, 'Wrap');
+        if (!body || !wrap) return;
+        if (scope === 'admin') {
+            const select = ocrEl(scope, 'Owner');
+            docs.forEach((doc) => ensureOwnerOption(select, doc.owner));
+        }
+        body.replaceChildren(...docs.map((doc) => ocrRow(scope, doc)));
+        wrap.classList.toggle('hidden', docs.length === 0);
+        if (docs.length === 0) {
+            setOcrState(scope, scope === 'admin'
+                ? 'No OCR documents yet. Run the pipeline to create one.'
+                : 'You have no OCR documents yet. Run the pipeline on your uploads.');
+        } else {
+            setOcrState(scope, '');
+        }
+    }
+
+    async function loadOcrDocs(scope) {
+        const body = ocrEl(scope, 'Body');
+        const wrap = ocrEl(scope, 'Wrap');
+        if (!body || !wrap) return;
+        let path = OCR_SCOPES[scope].base;
+        if (scope === 'admin') {
+            const owner = ocrEl(scope, 'Owner').value;
+            if (owner) path += `?owner=${encodeURIComponent(owner)}`;
+        }
+        setOcrState(scope, 'Loading OCR documents…');
+        try {
+            const data = await api(path);
+            const docs = data.documents || [];
+            ocrEl(scope, 'DocCount').textContent = data.truncated ? `${docs.length}+` : String(docs.length);
+            renderOcrTable(scope, docs);
+        } catch (e) {
+            body.replaceChildren();
+            wrap.classList.add('hidden');
+            ocrEl(scope, 'DocCount').textContent = '0';
+            setOcrState(scope, `Failed to load OCR documents: ${e.message}`, true);
+        }
+    }
+
+    async function loadOcrOwnerOptions() {
+        const select = ocrEl('admin', 'Owner');
+        if (!select) return;
+        try {
+            const users = await api('/admin/users');
+            const current = select.value;
+            select.replaceChildren();
+            const all = document.createElement('option');
+            all.value = '';
+            all.textContent = 'All owners';
+            select.appendChild(all);
+            users.map((u) => u.username).sort().forEach((name) => ensureOwnerOption(select, name));
+            select.value = current;
+        } catch (e) {
+            // The filter keeps "All owners". Owners that appear in the table are added when it renders.
+        }
+    }
+
+    async function viewOcrDocument(scope, doc) {
+        const viewer = ocrEl(scope, 'Viewer');
+        const text = ocrEl(scope, 'ViewerText');
+        if (!viewer || !text) return;
+        const seq = ++ocrViewerSeq;
+        ocrEl(scope, 'ViewerTitle').textContent = doc.doc_id;
+        const ownerPart = OCR_SCOPES[scope].showOwner ? ` \u2022 owner ${doc.owner}` : '';
+        ocrEl(scope, 'ViewerMeta').textContent = `${doc.md_filename}${ownerPart} \u2022 saved ${fmtSavedAt(doc.created_at)}`;
+        text.textContent = 'Loading…';
+        viewer.classList.remove('hidden');
+        viewer.scrollIntoView({ block: 'nearest' });
+        try {
+            const data = await api(ocrDocUrl(scope, doc));
+            if (seq !== ocrViewerSeq) return;
+            text.textContent = data.markdown_content || '(empty document)';
+            text.scrollTop = 0;
+        } catch (e) {
+            if (seq !== ocrViewerSeq) return;
+            text.textContent = `Failed to load document: ${e.message}`;
+        }
+    }
+
+    function closeOcrViewer(scope) {
+        ocrViewerSeq++;
+        const viewer = ocrEl(scope, 'Viewer');
+        if (viewer) viewer.classList.add('hidden');
+        const text = ocrEl(scope, 'ViewerText');
+        if (text) text.textContent = '';
+    }
+
+    async function downloadOcrDocument(scope, doc) {
+        try {
+            const markdown = await api(ocrDocUrl(scope, doc, '/markdown'));
+            const url = URL.createObjectURL(new Blob([markdown], { type: 'text/markdown;charset=utf-8' }));
+            const a = document.createElement('a');
+            a.href = url;
+            a.download = doc.md_filename || 'document.md';
+            document.body.appendChild(a);
+            a.click();
+            a.remove();
+            URL.revokeObjectURL(url);
+        } catch (e) {
+            alert('Download failed: ' + e.message);
+        }
+    }
+
     // ======================= User Documents Tab =======================
 
     async function loadUserDocuments() {
@@ -382,6 +591,7 @@
         } catch (e) {
             if ($('userDocList')) $('userDocList').innerHTML = `<p class="muted">Failed to load: ${e.message}</p>`;
         }
+        loadOcrDocs('user');
         loadUserOutputs();
     }
 
@@ -567,6 +777,11 @@
     if ($('refreshDocsBtn')) $('refreshDocsBtn').addEventListener('click', loadDocuments);
     if ($('refreshUserDocsBtn')) $('refreshUserDocsBtn').addEventListener('click', loadUserDocuments);
     if ($('refreshUserOutputsBtn')) $('refreshUserOutputsBtn').addEventListener('click', loadUserOutputs);
+    if ($('ocrRefresh')) $('ocrRefresh').addEventListener('click', () => { loadOcrDocs('admin'); loadOcrOwnerOptions(); });
+    if ($('ocrOwner')) $('ocrOwner').addEventListener('change', () => loadOcrDocs('admin'));
+    if ($('ocrViewerClose')) $('ocrViewerClose').addEventListener('click', () => closeOcrViewer('admin'));
+    if ($('userOcrRefresh')) $('userOcrRefresh').addEventListener('click', () => loadOcrDocs('user'));
+    if ($('userOcrViewerClose')) $('userOcrViewerClose').addEventListener('click', () => closeOcrViewer('user'));
 
     function showStatus(id, html, kind) {
         const s = $(id);
@@ -1208,6 +1423,365 @@
         }[s] || 'badge-mute';
     }
 
+    // ======================= OCR page progress =======================
+
+    // Elapsed time as m:ss, or h:mm:ss from one hour. Returns --:-- for missing values.
+    function formatClock(seconds) {
+        if (!Number.isFinite(seconds) || seconds < 0) return '--:--';
+        const t = Math.floor(seconds);
+        const h = Math.floor(t / 3600);
+        const m = String(Math.floor((t % 3600) / 60)).padStart(2, '0');
+        const s = String(t % 60).padStart(2, '0');
+        return h > 0 ? `${h}:${m}:${s}` : `${m}:${s}`;
+    }
+
+    // Time left, phrased as an estimate. Never shows a negative or huge value.
+    function formatEta(seconds) {
+        if (!Number.isFinite(seconds) || seconds < 0) return 'Calculating...';
+        if (seconds < 60) return 'under a minute';
+        if (seconds > 86400) return 'more than a day';
+        const mins = Math.round(seconds / 60);
+        if (mins < 60) return `about ${mins} min`;
+        const h = Math.floor(mins / 60);
+        const m = mins % 60;
+        return m ? `about ${h} h ${m} min` : `about ${h} h`;
+    }
+
+    // Phase of an OCR job as the UI shows it.
+    function ocrState(progress, status) {
+        if (status === 'completed' || progress.phase === 'finished') return 'completed';
+        if (status === 'killed' || progress.phase === 'killed') return progress.stopping ? 'stopping' : 'stopped';
+        // The worker only pauses between documents. Until it parks, the job is still busy.
+        if (status === 'paused') return progress.paused_since ? 'paused' : 'pausing';
+        if (progress.phase === 'queued' || status === 'queued') return 'queued';
+        if (progress.phase === 'rendering') return 'preparing';
+        if (progress.phase === 'extracting') return 'extracting';
+        if (progress.phase === 'graph_building') return 'graph';
+        if (progress.phase === 'saving') return 'saving';
+        if (!(progress.pages_total > 0)) return 'counting';
+        return 'running';
+    }
+
+    // Everything the progress UI needs. progress is null for jobs created before
+    // page progress existed. In that case the model falls back to document counts.
+    function ocrModel(progress, status, fallback) {
+        const fb = fallback || {};
+        if (!progress) {
+            const docsTotal = fb.docsTotal || 0;
+            const docsDone = Math.min(fb.docsDone || 0, docsTotal);
+            return {
+                legacy: true,
+                state: 'legacy',
+                pct: docsTotal ? Math.round(100 * docsDone / docsTotal) : 0,
+                indeterminate: false,
+                barClass: '',
+                statusText: 'Document progress',
+                statusTone: '',
+                caption: `${docsDone} of ${docsTotal} documents`,
+                note: 'Page-level progress is not recorded for this job.',
+                currentDoc: null,
+                etaText: '--',
+                pagesText: '--',
+                docsText: `${docsDone} of ${docsTotal}`,
+                rowText: '',
+            };
+        }
+
+        const state = ocrState(progress, status);
+        const total = Number(progress.pages_total) || 0;
+        const done = Math.max(0, Math.min(Number(progress.pages_done) || 0, total));
+        const docsTotal = Number(progress.docs_total) || 0;
+        const docsDone = Number(progress.docs_done) || 0;
+        const docNo = docsTotal ? Math.min(docsDone + 1, docsTotal) : 0;
+        const pagePart = total ? `Page ${done} of ${total}` : '';
+        const docPart = docsTotal ? `Document ${docNo} of ${docsTotal}` : '';
+        const currentDoc = progress.current_doc || null;
+        const eta = Number.isFinite(progress.eta_s) ? progress.eta_s : null;
+        const etaPhrase = eta === null ? 'Calculating...' : formatEta(eta);
+        const pct = total > 0 ? Math.round(100 * done / total) : null;
+
+        const m = {
+            legacy: false,
+            state,
+            pct,
+            indeterminate: false,
+            barClass: '',
+            statusText: '',
+            statusTone: '',
+            caption: [pagePart, docPart].filter(Boolean).join('  \u2022  '),
+            note: '',
+            currentDoc: null,
+            etaText: etaPhrase,
+            pagesText: total ? `${done} of ${total}` : '--',
+            docsText: docsTotal ? `${docsDone} of ${docsTotal}` : '--',
+            rowText: '',
+        };
+
+        switch (state) {
+            case 'queued':
+                m.statusText = 'Waiting to start';
+                m.caption = 'Waiting to start';
+                m.barClass = 'is-queued';
+                m.pct = null;
+                m.etaText = '--';
+                m.pagesText = '--';
+                m.rowText = 'Waiting to start';
+                break;
+            case 'preparing':
+                m.statusText = 'Preparing document';
+                m.caption = m.caption || 'Rendering pages';
+                m.etaText = '--';
+                m.currentDoc = currentDoc;
+                m.rowText = 'Preparing document';
+                break;
+            case 'counting':
+                m.statusText = 'Counting pages';
+                m.caption = 'Counting pages...';
+                m.indeterminate = true;
+                m.pct = null;
+                m.currentDoc = currentDoc;
+                m.rowText = 'Counting pages';
+                break;
+            case 'running':
+                m.statusText = 'OCR running';
+                m.caption = m.caption || 'Preparing pages';
+                m.currentDoc = currentDoc;
+                m.rowText = `${m.pagesText} pages \u2022 ${eta === null ? 'estimating time left' : formatEta(eta) + ' left'}`;
+                break;
+            case 'extracting':
+                m.statusText = 'Extracting fields';
+                m.note = 'Field extraction is not counted in OCR progress.';
+                m.currentDoc = currentDoc;
+                m.rowText = `${m.pagesText} pages \u2022 extracting fields`;
+                break;
+            case 'pausing':
+                m.statusText = 'Pausing';
+                m.statusTone = 'is-paused';
+                m.barClass = 'is-paused';
+                m.note = 'The current document finishes first, then the job pauses.';
+                m.currentDoc = currentDoc;
+                m.rowText = `${m.pagesText} pages \u2022 pausing after this document`;
+                break;
+            case 'paused':
+                m.statusText = 'Paused';
+                m.statusTone = 'is-paused';
+                m.barClass = 'is-paused';
+                m.note = 'The job is waiting. Resume to continue.';
+                m.etaText = 'Paused';
+                m.currentDoc = currentDoc;
+                m.rowText = `${m.pagesText} pages \u2022 paused`;
+                break;
+            case 'stopping':
+                m.statusText = 'Stopping after this document';
+                m.statusTone = 'is-paused';
+                m.barClass = 'is-paused';
+                m.note = 'The current document finishes first, then the job stops.';
+                m.currentDoc = currentDoc;
+                m.rowText = `${m.pagesText} pages \u2022 stopping after this document`;
+                break;
+            case 'stopped': {
+                // Pages that never ran were removed from pages_total. Measure against the planned
+                // total (run + not run), so a stopped job does not show 100%.
+                const skipped = Number(progress.pages_skipped) || 0;
+                const planned = total + skipped;
+                m.pct = planned ? Math.round(100 * done / planned) : null;
+                m.pagesText = planned ? `${done} of ${planned}` : '--';
+                m.statusText = planned ? `Stopped at page ${done} of ${planned}` : 'Stopped';
+                m.statusTone = 'is-stopped';
+                m.barClass = 'is-killed';
+                m.caption = [skipped ? `${skipped} pages not run` : '', docPart].filter(Boolean).join('  \u2022  ');
+                m.note = 'Pages already finished are kept.';
+                m.etaText = '--';
+                m.currentDoc = currentDoc;
+                m.rowText = m.statusText;
+                break;
+            }
+            case 'saving':
+                m.statusText = 'Saving OCR output';
+                m.note = 'Saving the output is not counted in OCR time.';
+                m.etaText = 'OCR finished';
+                m.currentDoc = currentDoc;
+                m.rowText = `${m.pagesText} pages \u2022 OCR done \u2022 saving output`;
+                break;
+            case 'graph':
+                m.statusText = 'OCR done, building graph memory';
+                m.note = 'OCR time is frozen. Graph memory time counts separately.';
+                m.etaText = 'OCR finished';
+                m.currentDoc = currentDoc;
+                m.rowText = 'OCR done \u2022 building graph memory';
+                break;
+            case 'completed':
+                m.statusText = 'Completed';
+                m.statusTone = 'is-completed';
+                m.pct = 100;
+                m.caption = [total ? `${total} pages` : '', docsTotal ? `${docsTotal} documents` : '']
+                    .filter(Boolean)
+                    .join('  \u2022  ');
+                m.rowText = total ? `${total} pages \u2022 done` : 'Done';
+                break;
+            default:
+                break;
+        }
+
+        // Two timers, each with its own value from the server. A timer runs while its
+        // start timestamp is set and its finish timestamp is not. The totals include
+        // every document of the job, and pauses are already excluded by the server.
+        const ocrSeconds = Number(progress.ocr_elapsed_s ?? progress.ocr_s) || 0;
+        const graphSeconds = Number(progress.graph_elapsed_s) || 0;
+        const ocrRunning = Boolean(progress.ocr_started_at) && !progress.ocr_finished_at;
+        const graphRunning = Boolean(progress.graph_started_at) && !progress.graph_finished_at;
+        // "done" refers to the current document. The server clears these timestamps when
+        // the next document starts, so the OCR box does not claim "done" while that
+        // document is still being prepared.
+        m.ocr = {
+            running: ocrRunning,
+            seconds: ocrSeconds,
+            done: !ocrRunning && Boolean(progress.ocr_finished_at),
+        };
+        // Graph memory is only built by graph_memory* strategies. An unknown strategy
+        // (older jobs) keeps the graph box.
+        m.graphUsed = fb.strategy ? String(fb.strategy).startsWith('graph_memory') : true;
+        m.graph = {
+            running: graphRunning,
+            seconds: graphSeconds,
+            done: !graphRunning && Boolean(progress.graph_finished_at),
+        };
+        m.graphStarted = graphRunning || Boolean(progress.graph_started_at) || graphSeconds > 0;
+        return m;
+    }
+
+    function ocrBarAttrs(m) {
+        // Legacy jobs have no page counts, so their bar measures documents.
+        const label = m.legacy ? 'OCR document progress' : 'OCR page progress';
+        const unit = m.legacy ? '% of documents' : '% of pages';
+        if (m.indeterminate || m.pct === null) {
+            return `role="progressbar" aria-label="${label}" aria-valuemin="0" aria-valuemax="100" aria-valuetext="${escapeHtml(m.caption || m.statusText)}"`;
+        }
+        return `role="progressbar" aria-label="${label}" aria-valuemin="0" aria-valuemax="100" aria-valuenow="${m.pct}" aria-valuetext="${escapeHtml(`${m.pct}${unit}. ${m.caption}`)}"`;
+    }
+
+    // Compact bar for list rows. Replaces the document-only bar in the same slot.
+    function ocrRowBarMarkup(m) {
+        const cls = ['progress-bar-fill', 'ocr-fill', m.barClass, m.indeterminate ? 'is-indeterminate' : '']
+            .filter(Boolean)
+            .join(' ');
+        const style = m.indeterminate ? '' : ` style="width:${m.pct === null ? 0 : m.pct}%"`;
+        return `<div class="progress-bar-wrap" ${ocrBarAttrs(m)}><div class="${cls}"${style}></div></div>`;
+    }
+
+    function ocrRowTextMarkup(m) {
+        if (m.legacy || !m.rowText) return '';
+        return `<div class="job-meta ocr-row-text">${escapeHtml(m.rowText)}</div>`;
+    }
+
+    // Data attributes that let tickOcrElapsed count a running timer between polls.
+    function timerClockAttrs(kind, timer) {
+        if (!timer.running) return '';
+        return ` data-${kind}-clock="running" data-${kind}-base="${timer.seconds}" data-${kind}-at="${Date.now()}"`;
+    }
+
+    // The OCR timer and the graph memory timer, side by side. Their text is fixed
+    // strings or numbers from the server, so no escaping is needed for the sub-lines.
+    function timerStatsHtml(m, showEta) {
+        const ocr = m.ocr;
+        const graph = m.graph;
+        const ocrValue = ocr.running || ocr.seconds > 0 ? formatClock(ocr.seconds) : '--:--';
+        let ocrSub = 'Not started';
+        if (ocr.running) ocrSub = 'OCR running';
+        else if (ocr.done) ocrSub = `OCR done in ${ocr.seconds.toFixed(1)}s`;
+        else if (ocr.seconds > 0) ocrSub = 'Waiting for next document';
+
+        let graphValue = '--:--';
+        let graphSub;
+        if (!m.graphUsed) {
+            graphSub = 'Not used for page scan';
+        } else {
+            graphValue = graph.running || graph.seconds > 0 ? formatClock(graph.seconds) : '--:--';
+            if (graph.running) {
+                graphSub = '<span class="graph-build-spinner" aria-hidden="true"></span><span>Building graph memory\u2026</span>';
+            } else if (graph.done) {
+                graphSub = `Graph built in ${graph.seconds.toFixed(1)}s`;
+            } else if (m.state === 'completed' || m.state === 'stopped') {
+                graphSub = 'Not run';
+            } else if (graph.seconds > 0) {
+                graphSub = 'Waiting for next document';
+            } else {
+                graphSub = 'Starts after OCR';
+            }
+        }
+
+        return `
+            <div class="job-summary-grid ocr-stats">
+                <div class="summary-box ocr-timer${ocr.running ? ' is-running' : ''}" data-timer="ocr">
+                    <div class="lbl">OCR time</div>
+                    <div class="val"${timerClockAttrs('ocr', ocr)}>${ocrValue}</div>
+                    <div class="ocr-timer-sub">${ocrSub}</div>
+                </div>
+                <div class="summary-box ocr-timer graph-timer${graph.running ? ' is-running' : ''}" data-timer="graph">
+                    <div class="lbl">Graph memory</div>
+                    <div class="val"${timerClockAttrs('graph', graph)}>${graphValue}</div>
+                    <div class="ocr-timer-sub">${graphSub}</div>
+                </div>
+                <div class="summary-box"><div class="lbl">${showEta ? 'OCR time left' : 'Documents'}</div><div class="val">${escapeHtml(showEta ? m.etaText : m.docsText)}</div></div>
+                <div class="summary-box"><div class="lbl">Pages</div><div class="val">${escapeHtml(m.pagesText)}</div></div>
+            </div>`;
+    }
+
+    function jobProgressHtml(m) {
+        const cls = ['ocr-fill', m.barClass, m.indeterminate ? 'is-indeterminate' : '']
+            .filter(Boolean)
+            .join(' ');
+        const fillStyle = m.indeterminate ? '' : ` style="width:${m.pct === null ? 0 : m.pct}%"`;
+        const pctText = m.pct === null ? '--' : `${m.pct}%`;
+        const showEta = m.state !== 'completed';
+        const stats = m.legacy ? '' : timerStatsHtml(m, showEta);
+        return `
+            <div class="ocr-progress-status-line"><span class="ocr-progress-status ${m.statusTone}">${escapeHtml(m.statusText)}</span></div>
+            <div class="ocr-progress-bar-row">
+                <div class="ocr-progress-track" ${ocrBarAttrs(m)}><div class="${cls}"${fillStyle}></div></div>
+                <div class="ocr-progress-pct" aria-hidden="true">${pctText}</div>
+            </div>
+            ${m.caption ? `<div class="ocr-progress-caption">${escapeHtml(m.caption)}</div>` : ''}
+            ${m.currentDoc ? `<div class="ocr-progress-doc">Current file: <code>${escapeHtml(m.currentDoc)}</code></div>` : ''}
+            ${m.note ? `<div class="ocr-progress-note">${escapeHtml(m.note)}</div>` : ''}
+            ${stats}`;
+    }
+
+    // Draws the detail panel. The fill animates from its previous width when the
+    // panel is redrawn on the next poll.
+    function renderJobProgressPanel(host, job) {
+        const m = ocrModel(job.progress, job.status, {
+            docsDone: (job.successes || []).length + (job.failures || []).length,
+            docsTotal: (job.targets || []).length,
+            strategy: job.strategy,
+        });
+        host.classList.remove('hidden');
+        host.innerHTML = jobProgressHtml(m);
+
+        const fill = host.querySelector('.ocr-fill');
+        const prevRaw = host.dataset.pct;
+        if (fill && !m.indeterminate && prevRaw !== undefined && prevRaw !== '' && Number(prevRaw) !== m.pct) {
+            fill.style.width = `${prevRaw}%`;
+            void fill.offsetWidth; // commit the previous width so the change animates
+            fill.style.width = `${m.pct === null ? 0 : m.pct}%`;
+        }
+        host.dataset.pct = m.pct === null ? '' : String(m.pct);
+    }
+
+    // Counts each running timer forward between polls. Each poll sets the server value
+    // and the time it was received, so a page refresh resumes from the server's number.
+    function tickOcrElapsed() {
+        const now = Date.now();
+        ['ocr', 'graph'].forEach((kind) => {
+            document.querySelectorAll(`[data-${kind}-clock="running"]`).forEach((node) => {
+                const base = Number(node.dataset[`${kind}Base`]);
+                const at = Number(node.dataset[`${kind}At`]);
+                if (!Number.isFinite(base) || !Number.isFinite(at)) return;
+                node.textContent = formatClock(base + (now - at) / 1000);
+            });
+        });
+    }
+
     async function pauseJob(jobId, e) {
         if (e) e.stopPropagation();
         try {
@@ -1259,7 +1833,7 @@
             jobs.forEach(j => {
                 const done = j.completed || 0;
                 const total = j.total || 0;
-                const pct = total ? Math.round(100 * done / total) : 0;
+                const ocr = ocrModel(j.progress, j.status, { docsDone: done, docsTotal: total, strategy: j.strategy });
                 const row = el('div', 'job-item');
 
                 let actionButtons = '';
@@ -1279,9 +1853,10 @@
                     <div class="job-item-left">
                         <div class="job-id">${escapeHtml(j.job_id)}</div>
                         <div class="job-meta">${escapeHtml(j.created_at || '')} • schema: ${escapeHtml(j.schema_id || '--')} • ${done}/${total} docs</div>
+                        ${ocrRowTextMarkup(ocr)}
                     </div>
                     <div class="job-item-right">
-                        <div class="progress-bar-wrap"><div class="progress-bar-fill" style="width:${pct}%"></div></div>
+                        ${ocrRowBarMarkup(ocr)}
                         <span class="badge ${jobStatusBadgeClass(j.status)}">${escapeHtml(j.status)}</span>
                         <div class="job-item-actions">${actionButtons}</div>
                     </div>
@@ -1389,10 +1964,16 @@
                 killBtn.onclick = (e) => isUser ? killUserJob(jobId, e) : killJob(jobId, e);
             }
 
+            const progressHost = isUser ? $('userJobProgress') : $('adminJobProgress');
+            if (progressHost) renderJobProgressPanel(progressHost, j);
+
             const host = isUser ? ($('userJobDetail') || $('jobDetail')) : $('jobDetail');
             if (!host) return;
 
-            const newJsonStr = JSON.stringify(j);
+            // progress has live elapsed time, so it is kept out of the JSON view and the change check.
+            // Otherwise the JSON view would be rebuilt on every poll.
+            const { progress: _progress, ...jobForView } = j;
+            const newJsonStr = JSON.stringify(jobForView);
             // Skip full DOM rebuild if this job's data is identical to what's already rendered
             if (window.__renderedJobId === j.job_id && window.__renderedJobJson === newJsonStr && host.children.length > 0) {
                 return;
@@ -1424,13 +2005,14 @@
                             <div style="display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 8px;">
                                 <div>
                                     <span class="result-name">${escapeHtml(s.pdf)}</span>
-                                    <div class="result-meta">pages: ${s.pages} • conf: ${(s.avg_conf || 0).toFixed(3)} • Layer 1+2: ${s.elapsed_s}s ${s.extract_elapsed_s ? `• Layer 3 (${s.strategy || 'extract'}): ${s.extract_elapsed_s}s` : ''}</div>
+                                    <div class="result-meta">pages: ${s.pages} • conf: ${(s.avg_conf || 0).toFixed(3)} • Layer 1+2: ${s.elapsed_s}s ${s.extract_elapsed_s ? `• Layer 3 (${s.strategy || 'extract'}): ${s.extract_elapsed_s}s` : ''}${s.ocr_elapsed_s !== undefined ? ` • OCR ${Number(s.ocr_elapsed_s).toFixed(1)}s • graph ${s.graph_elapsed_s ? `${Number(s.graph_elapsed_s).toFixed(1)}s` : 'not run'}` : ''}</div>
                                 </div>
                                 <div style="display: flex; gap: 6px; align-items: center; flex-wrap: wrap;">
                                     ${(s.strategy || '').startsWith('graph_memory')
-                                        ? `<span class="badge badge-primary" style="background:rgba(124,58,237,0.2);color:#c084fc;border:1px solid rgba(124,58,237,0.4)">${s.strategy === 'graph_memory_concurrent' ? '' : ''} ${s.strategy === 'graph_memory_concurrent' ? 'Graph Memory Concurrent' : 'Graph Memory'} (${s.graph_nodes || 0} nodes, ${s.graph_edges || 0} edges)</span>`
+                                        ? `<span class="badge badge-primary">${s.strategy === 'graph_memory_concurrent' ? '' : ''} ${s.strategy === 'graph_memory_concurrent' ? 'Graph Memory Concurrent' : 'Graph Memory'} (${s.graph_nodes || 0} nodes, ${s.graph_edges || 0} edges)</span>`
                                         : `<span class="badge badge-mute">Classic Page Scan</span>`}
                                     ${s.db_run_id ? `<span class="badge badge-success">PostgreSQL: Run #${s.db_run_id}</span>` : ''}
+                                    ${s.md_db_saved === true ? '<span class="badge badge-success">OCR text saved to DB</span>' : (s.md_db_saved === false ? '<span class="badge badge-warn">OCR text not saved to DB</span>' : '')}
                                     <span class="result-meta"><code>${escapeHtml(s.md)}</code></span>
                                 </div>
                             </div>
@@ -1444,8 +2026,8 @@
                             </div>
                             ` : ''}
                             ${s.graph_memory && s.graph_memory.snapshot ? `
-                            <details class="graph-memory-details" style="margin-top: 6px; background: rgba(124,58,237,0.08); border: 1px solid rgba(124,58,237,0.25); border-radius: 6px; padding: 8px 12px;">
-                                <summary style="cursor: pointer; font-weight: 600; color: #c084fc; font-size: 12px; user-select: none;">
+                            <details class="graph-memory-details">
+                                <summary class="graph-memory-summary">
                                     Document Knowledge Graph (${s.graph_nodes || 0} Entities, ${s.graph_edges || 0} Relationships)
                                 </summary>
                                 <div style="margin-top: 8px; font-size: 11px;">
@@ -1454,12 +2036,12 @@
                                         <span class="badge badge-warn font-mono">Relationships: ${s.graph_edges || 0}</span>
                                         <span class="badge badge-primary font-mono">Strategy: Graph Memory</span>
                                     </div>
-                                    <div style="max-height: 220px; overflow-y: auto; background: rgba(0,0,0,0.3); border-radius: 4px; padding: 8px; margin-bottom: 6px;">
+                                    <div class="graph-memory-list" style="max-height: 220px; margin-bottom: 6px;">
                                         <strong>Captured Graph Nodes &amp; Evidence:</strong>
                                         <ul style="margin: 4px 0 0 16px; padding: 0;">
                                             ${(s.graph_memory.snapshot.nodes || []).map(n => `
                                                 <li style="margin-bottom: 4px;">
-                                                    <span style="color:#c084fc; font-weight:600;">[${escapeHtml(n.type)}]</span>
+                                                    <span class="graph-memory-type">[${escapeHtml(n.type)}]</span>
                                                     <strong>${escapeHtml(n.label || '')}:</strong> <code>${escapeHtml(n.value || '')}</code>
                                                     <span class="muted small">(Pages: ${(n.source_pages || []).join(',')}, conf: ${n.confidence})</span>
                                                     ${(n.evidence && n.evidence.length) ? `<div class="muted small" style="padding-left: 12px; font-style: italic;">"${escapeHtml(n.evidence[0].text || '')}"</div>` : ''}
@@ -1468,12 +2050,12 @@
                                         </ul>
                                     </div>
                                     ${(s.graph_memory.snapshot.edges || []).length ? `
-                                    <div style="max-height: 180px; overflow-y: auto; background: rgba(0,0,0,0.3); border-radius: 4px; padding: 8px;">
+                                    <div class="graph-memory-list" style="max-height: 180px;">
                                         <strong>Entity Relationships &amp; Cross-Page Anaphora:</strong>
                                         <ul style="margin: 4px 0 0 16px; padding: 0;">
                                             ${(s.graph_memory.snapshot.edges || []).map(e => `
                                                 <li style="margin-bottom: 4px;">
-                                                    <code>${escapeHtml(e.source_node)}</code> --[<strong style="color:#6ee7b7">${escapeHtml(e.relationship)}</strong> (status: ${escapeHtml(e.status)})]--> <code>${escapeHtml(e.target_node)}</code>
+                                                    <code>${escapeHtml(e.source_node)}</code> --[<strong class="graph-memory-rel">${escapeHtml(e.relationship)}</strong> (status: ${escapeHtml(e.status)})]--> <code>${escapeHtml(e.target_node)}</code>
                                                     <span class="muted small">(P${e.source_page})</span>
                                                     ${e.evidence ? `<div class="muted small" style="padding-left: 12px; font-style: italic;">"${escapeHtml(e.evidence)}"</div>` : ''}
                                                 </li>
@@ -1512,7 +2094,7 @@
                             <button class="btn btn-sm btn-primary" onclick="downloadJobPdf('${j.job_id}')">Download PDF</button>
                         </div>
                     </div>
-                    <pre id="fullJsonView" class="job-full-json-pre">${escapeHtml(JSON.stringify(j, null, 2))}</pre>
+                    <pre id="fullJsonView" class="job-full-json-pre">${escapeHtml(JSON.stringify(jobForView, null, 2))}</pre>
                 </div>
 
             `;
@@ -1661,7 +2243,7 @@
             jobs.forEach(j => {
                 const total = j.total || 0;
                 const done = (j.succeeded || 0) + (j.failed || 0);
-                const pct = total ? Math.round(100 * done / total) : 0;
+                const ocr = ocrModel(j.progress, j.status, { docsDone: done, docsTotal: total });
                 const row = el('div', 'user-job-row');
 
                 let actionButtons = '';
@@ -1692,9 +2274,10 @@
                             Failed: <strong style="color:#fca5a5">${j.failed}</strong> •
                             Remaining: ${j.remaining} / ${total}${currentDoc}
                         </div>
+                        ${ocrRowTextMarkup(ocr)}
                     </div>
                     <div class="user-job-row-right">
-                        <div class="progress-bar-wrap"><div class="progress-bar-fill" style="width:${pct}%"></div></div>
+                        ${ocrRowBarMarkup(ocr)}
                         <div class="job-item-actions">${actionButtons}</div>
                     </div>
                 `;
@@ -2287,6 +2870,8 @@
             else if (state.role === 'user') loadUserJobs();
         }
     }, 4000);
+    // Text-only clock update between polls. It makes no network calls.
+    setInterval(tickOcrElapsed, 1000);
 
 })();
 

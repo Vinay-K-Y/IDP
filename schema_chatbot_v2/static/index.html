@@ -7,7 +7,7 @@
     <meta http-equiv="Pragma" content="no-cache">
     <meta http-equiv="Expires" content="0">
     <title>IDP — Extraction Pipeline Console</title>
-    <link rel="stylesheet" href="style.css?v=31">
+    <link rel="stylesheet" href="style.css?v=35">
 </head>
 <body>
     <!-- =========================== LOGIN OVERLAY =========================== -->
@@ -26,416 +26,556 @@
                     <input type="password" id="loginPassword" placeholder="••••••••" required autocomplete="current-password">
                 </div>
                 <div id="loginError" class="status-box error hidden"></div>
-                <button type="submit" id="loginSubmitBtn" class="btn btn-primary btn-full btn-lg mt-2">Sign In</button>
+                <button type="submit" id="loginSubmitBtn" class="btn btn-primary btn-full btn-lg">Sign In</button>
             </form>
         </div>
     </div>
 
-    <!-- =========================== APP HEADER =========================== -->
-    <header class="app-header">
-        <div class="header-left">
-            <h1>IDP Console</h1>
-        </div>
-        <div class="header-right">
-            <button id="themeToggleBtn" class="theme-toggle-btn" type="button" title="Toggle Light/Dark Theme">
-                <span class="theme-toggle-icon" id="themeIcon"></span>
-                <span id="themeLabel">Light Mode</span>
-            </button>
-            <div id="userHeaderSection" class="user-header-section hidden">
-                <span id="userBadge" class="badge badge-primary">user</span>
-                <button id="logoutBtn" class="btn btn-ghost btn-sm" title="Log out">Logout</button>
+    <div class="app-shell">
+        <!-- =========================== SIDEBAR (navigation shell) =========================== -->
+        <aside class="app-sidebar" aria-label="Console">
+            <div class="brand">
+                <span class="brand-mark" aria-hidden="true">I</span>
+                <span class="brand-name">IDP Console</span>
             </div>
-        </div>
-    </header>
 
-    <!-- =========================== NAVIGATION TABS =========================== -->
-    <nav class="tabs" id="mainTabs">
-        <button class="tab-btn active" data-tab="chatbot" id="tabBtnChatbot">Schema Builder &amp; Pipeline</button>
-        <button class="tab-btn admin-only" data-tab="documents" id="tabBtnDocuments">Shared Dataset</button>
-        <button class="tab-btn user-only hidden" data-tab="user-documents" id="tabBtnUserDocuments">My Documents</button>
-        <button class="tab-btn admin-only" data-tab="logs" id="tabBtnLogs">Logs</button>
-        <button class="tab-btn admin-only" data-tab="users" id="tabBtnUsers">User Management</button>
-        <button class="tab-btn" data-tab="querybot" id="tabBtnQueryBot">Query Bot</button>
-    </nav>
+            <nav class="tabs" id="mainTabs" aria-label="Main navigation">
+                <div class="nav-group">
+                    <div class="nav-group-label l">Workspace</div>
+                    <button class="tab-btn active" data-tab="chatbot" id="tabBtnChatbot">Schema Builder &amp; Pipeline</button>
+                    <button class="tab-btn" data-tab="querybot" id="tabBtnQueryBot">Query Bot</button>
+                </div>
+                <div class="nav-group">
+                    <div class="nav-group-label l">Data</div>
+                    <button class="tab-btn admin-only" data-tab="documents" id="tabBtnDocuments">Shared Dataset</button>
+                    <button class="tab-btn user-only hidden" data-tab="user-documents" id="tabBtnUserDocuments">My Documents</button>
+                </div>
+                <div class="nav-group admin-only">
+                    <div class="nav-group-label l">Admin</div>
+                    <button class="tab-btn admin-only" data-tab="logs" id="tabBtnLogs">Logs</button>
+                    <button class="tab-btn admin-only" data-tab="users" id="tabBtnUsers">User Management</button>
+                </div>
+            </nav>
 
-    <main class="content">
-        <!-- =========================== TAB: Schema Builder & Pipeline =========================== -->
-        <section id="tab-chatbot" class="tab-panel active">
-            <div class="schema-builder-container">
-                <div class="card schema-builder-card">
-                    <div class="card-header">
-                        <div class="header-titles">
+            <div class="sidebar-footer">
+                <button id="themeToggleBtn" class="theme-toggle-btn" type="button" title="Toggle Light/Dark Theme">
+                    <span class="theme-toggle-icon" id="themeIcon" aria-hidden="true"></span>
+                    <span id="themeLabel">Light Mode</span>
+                </button>
+                <div id="userHeaderSection" class="user-header-section hidden">
+                    <span id="userBadge" class="badge badge-primary">user</span>
+                    <button id="logoutBtn" class="btn btn-ghost btn-sm" title="Log out">Logout</button>
+                </div>
+            </div>
+        </aside>
+
+        <main class="content">
+            <!-- =========================== TAB: Schema Builder & Pipeline =========================== -->
+            <section id="tab-chatbot" class="tab-panel active">
+                <div class="page-head">
+                    <div>
+                        <h1>Schema Builder &amp; Pipeline</h1>
+                        <p class="s">Define the extraction schema, then run the pipeline over the documents.</p>
+                    </div>
+                </div>
+
+                <div class="schema-builder-container">
+                    <div class="card schema-builder-card">
+                        <div class="card-header">
                             <h2>Interactive Schema Builder</h2>
+                            <div class="card-actions">
+                                <button type="button" class="btn btn-outline btn-sm" id="toggleJsonPreviewBtn" title="Toggle JSON view">Preview JSON</button>
+                                <button type="button" class="btn btn-ghost btn-sm" id="clearSchemaBtn" title="Clear all fields">Clear</button>
+                            </div>
                         </div>
-                        <div class="card-actions">
-                            <button type="button" class="btn btn-outline btn-sm" id="toggleJsonPreviewBtn" title="Toggle JSON view">Preview JSON</button>
-                            <button type="button" class="btn btn-ghost btn-sm" id="clearSchemaBtn" title="Clear all fields">Clear</button>
+
+                        <!-- Presets Bar -->
+                        <div class="schema-presets-bar">
+                            <span class="l">Quick Presets</span>
+                            <button type="button" class="btn btn-xs btn-outline preset-btn" data-preset="medical">Medical Discharge</button>
+                            <button type="button" class="btn btn-xs btn-outline preset-btn" data-preset="invoice">Invoice</button>
+                            <button type="button" class="btn btn-xs btn-outline preset-btn" data-preset="resume">Resume</button>
+                            <button type="button" class="btn btn-xs btn-ghost preset-btn" data-preset="blank">Blank</button>
                         </div>
-                    </div>
 
-                    <!-- Presets Bar -->
-                    <div class="schema-presets-bar">
-                        <span class="muted small"><strong>Quick Presets:</strong></span>
-                        <button type="button" class="btn btn-xs btn-outline preset-btn" data-preset="medical">Medical Discharge</button>
-                        <button type="button" class="btn btn-xs btn-outline preset-btn" data-preset="invoice">Invoice</button>
-                        <button type="button" class="btn btn-xs btn-outline preset-btn" data-preset="resume">Resume</button>
-                        <button type="button" class="btn btn-xs btn-ghost preset-btn" data-preset="blank">Blank</button>
-                    </div>
-
-                    <!-- Document Type Row -->
-                    <div class="doc-type-edit-row">
-                        <label for="editDocType">Document Type <span class="required-star" style="color:var(--danger, #ef4444)">*</span>:</label>
-                        <input id="editDocType" class="doc-type-input" type="text" placeholder="e.g. medical_discharge_summary, invoice, resume" autocomplete="off">
-                    </div>
-
-                    <!-- Schema Name Row (used for per-user versioning: same name => v1, v2, v3...) -->
-                    <div class="doc-type-edit-row">
-                        <label for="editSchemaName">Schema Name:</label>
-                        <input id="editSchemaName" class="doc-type-input" type="text" placeholder="e.g. my_invoice_schema (reused name auto-versions v1, v2, v3)" autocomplete="off">
-                    </div>
-
-                    <!-- Fields Table Container -->
-                    <div id="schemaPanel" class="schema-panel-container">
-                        <p class="muted">No schema yet.</p>
-                    </div>
-
-                    <!-- Live Validation Errors -->
-                    <div id="schemaErrors" class="error-list hidden"></div>
-
-                    <!-- Collapsible JSON Preview Box -->
-                    <div id="schemaJsonPreviewBox" class="json-preview-box hidden mt-1">
-                        <div class="preview-header" style="display:flex; justify-content:space-between; align-items:center; padding: 4px 8px;">
-                            <span class="muted small font-mono">Payload JSON Preview:</span>
+                        <!-- Document Type Row -->
+                        <div class="doc-type-edit-row">
+                            <label for="editDocType">Document Type <span class="required-star">*</span></label>
+                            <input id="editDocType" class="doc-type-input" type="text" placeholder="e.g. medical_discharge_summary, invoice, resume" autocomplete="off">
                         </div>
-                        <pre id="schemaJsonView" class="json-code-block" style="margin: 0; padding: 10px; border-radius: 4px; overflow-x: auto; max-height: 240px; font-size: 11px;"></pre>
-                    </div>
 
-                    <!-- Save & Confirm Action -->
-                    <div class="schema-confirm-bar mt-2">
-                        <button type="button" class="btn btn-success btn-lg btn-full" id="confirmBtn">
-                            Save &amp; Confirm Schema
-                        </button>
-                    </div>
-                    <div id="confirmStatus" class="status-box hidden mt-1"></div>
-
-                    <!-- Post-Confirmation Actions Bar -->
-                    <div id="postConfirmBox" class="post-confirm-actions-box mt-2 hidden">
-                        <div class="success-banner" style="display: flex; align-items: center; justify-content: space-between; padding: 10px 14px; background: rgba(34, 197, 94, 0.12); border: 1px solid rgba(34, 197, 94, 0.35); border-radius: var(--radius-sm);">
-                            <span style="font-weight: 600; color: #22c55e;">Schema Confirmed &amp; Saved to Registry</span>
-                            <span class="schema-confirmed-id font-mono small" id="confirmedSchemaIdText"></span>
+                        <!-- Schema Name Row (used for per-user versioning: same name => v1, v2, v3...) -->
+                        <div class="doc-type-edit-row">
+                            <label for="editSchemaName">Schema Name</label>
+                            <input id="editSchemaName" class="doc-type-input" type="text" placeholder="e.g. my_invoice_schema (reused name auto-versions v1, v2, v3)" autocomplete="off">
                         </div>
-                        <div class="pipeline-actions mt-1">
-                            <button type="button" class="btn btn-success btn-lg btn-full" id="quickRunPipelineBtn">
-                                Run Extraction Pipeline Now
+
+                        <!-- Fields Table Container -->
+                        <div id="schemaPanel" class="schema-panel-container">
+                            <p class="muted">No schema yet.</p>
+                        </div>
+
+                        <!-- Live Validation Errors -->
+                        <div id="schemaErrors" class="error-list hidden"></div>
+
+                        <!-- Collapsible JSON Preview Box -->
+                        <div id="schemaJsonPreviewBox" class="json-preview-box hidden">
+                            <div class="preview-header">
+                                <span class="l">Payload JSON Preview</span>
+                            </div>
+                            <pre id="schemaJsonView" class="json-code-block"></pre>
+                        </div>
+
+                        <!-- Save & Confirm Action -->
+                        <div class="schema-confirm-bar">
+                            <button type="button" class="btn btn-success btn-lg btn-full" id="confirmBtn">
+                                Save &amp; Confirm Schema
                             </button>
                         </div>
-                        <div class="schema-download-actions mt-1" style="display: flex; gap: 8px;">
-                            <button type="button" class="btn btn-outline btn-sm btn-full" id="downloadSchemaPdfBtn">
-                                Download Schema PDF
-                            </button>
-                            <button type="button" class="btn btn-outline btn-sm btn-full" id="downloadSchemaJsonBtn">
-                                Download Schema JSON
-                            </button>
+                        <div id="confirmStatus" class="status-box hidden"></div>
+
+                        <!-- Post-Confirmation Actions Bar -->
+                        <div id="postConfirmBox" class="post-confirm-actions-box hidden">
+                            <div class="success-banner">
+                                <span>Schema Confirmed &amp; Saved to Registry</span>
+                                <span class="schema-confirmed-id font-mono small" id="confirmedSchemaIdText"></span>
+                            </div>
+                            <div class="pipeline-actions">
+                                <button type="button" class="btn btn-success btn-lg btn-full" id="quickRunPipelineBtn">
+                                    Run Extraction Pipeline Now
+                                </button>
+                            </div>
+                            <div class="schema-download-actions">
+                                <button type="button" class="btn btn-outline btn-sm btn-full" id="downloadSchemaPdfBtn">
+                                    Download Schema PDF
+                                </button>
+                                <button type="button" class="btn btn-outline btn-sm btn-full" id="downloadSchemaJsonBtn">
+                                    Download Schema JSON
+                                </button>
+                            </div>
                         </div>
                     </div>
                 </div>
-            </div>
 
-            <!-- =========================== Admin Pipeline Section =========================== -->
-            <div id="adminPipelineSection" class="pipeline-section mt-3 admin-only">
-                <div class="card">
-                    <div class="card-header">
-                        <h2>Run Extraction Pipeline (Admin)</h2>
-                        <span id="pipelineAvail" class="badge badge-mute">checking…</span>
-                    </div>
+                <!-- =========================== Admin Pipeline Section =========================== -->
+                <div id="adminPipelineSection" class="pipeline-section admin-only">
+                    <div class="card">
+                        <div class="card-header">
+                            <div>
+                                <h2>Run Extraction Pipeline (Admin)</h2>
+                                <p class="s">Configure the pipeline settings, select documents and start the extraction process.</p>
+                            </div>
+                            <span id="pipelineAvail" class="badge badge-mute">checking…</span>
+                        </div>
 
-                    <div class="form-row">
-                        <label>
-                            <strong>Target Schema</strong>
-                            <select id="schemaSelect" disabled>
-                                <option value="">— load schemas first —</option>
-                            </select>
-                            <button class="btn btn-ghost btn-sm mt-1" id="refreshSchemasBtn">Refresh Schemas</button>
-                        </label>
-                    </div>
+                        <div class="pipe-config-grid">
+                            <div class="pipe-config-card">
+                                <label for="schemaSelect" class="l">Target Schema</label>
+                                <select id="schemaSelect" disabled>
+                                    <option value="">— load schemas first —</option>
+                                </select>
+                                <div>
+                                    <button class="btn btn-ghost btn-sm" id="refreshSchemasBtn">Refresh Schemas</button>
+                                </div>
+                            </div>
 
-                    <div class="form-row">
-                        <label for="layer3StrategySelect">
-                            <strong>Layer 3 Extraction Strategy</strong>
-                            <select id="layer3StrategySelect" class="themed-select" style="width: 100%; padding: 8px 12px; border-radius: var(--radius-sm); background: var(--input-bg); color: var(--fg); border: 1px solid var(--border); font-size: 13px; font-weight: 500;">
-                                <option value="graph_memory_concurrent" selected>Graph Memory Concurrent</option>
-                                <option value="graph_memory">Graph Memory Sequential</option>
-                                <option value="graph_memory_epoch">Epoch</option>
-                            </select>
-                        </label>
-                    </div>
+                            <div class="pipe-config-card">
+                                <label for="layer3StrategySelect" class="l">Layer 3 Extraction Strategy</label>
+                                <select id="layer3StrategySelect">
+                                    <option value="graph_memory_concurrent" selected>Graph Memory Concurrent</option>
+                                    <option value="graph_memory">Graph Memory Sequential</option>
+                                    <option value="graph_memory_epoch">Epoch</option>
+                                </select>
+                            </div>
+                        </div>
 
-                    <div class="form-row">
-                        <label>
-                            <strong>Documents to Process</strong>
+                        <div class="pipe-docs-card">
+                            <div class="card-header">
+                                <div>
+                                    <h2>Documents to Process</h2>
+                                    <p class="s">Select the PDF files you want to process through the pipeline.</p>
+                                </div>
+                                <div class="card-actions">
+                                    <button class="btn btn-ghost btn-sm" id="selAllBtn" disabled>Select All</button>
+                                    <button class="btn btn-ghost btn-sm" id="selNoneBtn" disabled>Select None</button>
+                                </div>
+                            </div>
+                            <div class="check-head l" aria-hidden="true">
+                                <span></span>
+                                <span>File Name</span>
+                                <span>Size</span>
+                                <span>Status</span>
+                            </div>
                             <div id="docChecklist" class="checklist">
                                 <p class="muted small">Loading documents from dataset...</p>
                             </div>
-                        </label>
-                        <div class="row-actions">
-                            <button class="btn btn-ghost btn-sm" id="selAllBtn" disabled>Select All</button>
-                            <button class="btn btn-ghost btn-sm" id="selNoneBtn" disabled>Select None</button>
+                        </div>
+
+                        <div class="pipeline-actions">
+                            <button class="btn btn-primary btn-lg btn-full" id="runPipelineBtn" disabled>
+                                Run Extraction Pipeline
+                            </button>
                         </div>
                     </div>
 
-                    <div class="pipeline-actions">
-                        <button class="btn btn-primary btn-lg btn-full" id="runPipelineBtn" disabled>
-                            Run Extraction Pipeline
-                        </button>
-                    </div>
-                </div>
-
-                <div class="card">
-                    <div class="card-header">
-                        <h2>Job Output &amp; History (All Users)</h2>
-                        <button class="btn btn-ghost btn-sm" id="refreshJobsBtn">Refresh</button>
-                    </div>
-                    <div id="jobList">
-                        <p class="muted">No jobs yet.</p>
-                    </div>
-                </div>
-
-                <div id="jobDetailCard" class="card hidden">
-                    <div class="card-header">
-                        <h2>Job Detail: <span id="detailJobId">—</span></h2>
-                        <div class="card-actions">
-                            <span id="detailStatus" class="badge">—</span>
-                            <button class="btn btn-sm btn-warn hidden" id="jobPauseBtn" title="Pause active job">Pause</button>
-                            <button class="btn btn-sm btn-primary hidden" id="jobResumeBtn" title="Resume paused job">Resume</button>
-                            <button class="btn btn-sm btn-danger hidden" id="jobKillBtn" title="Kill / cancel job">Kill</button>
+                    <div class="card">
+                        <div class="card-header">
+                            <h2>Job Output &amp; History (All Users)</h2>
+                            <button class="btn btn-ghost btn-sm" id="refreshJobsBtn">Refresh</button>
+                        </div>
+                        <div id="jobList">
+                            <p class="muted">No jobs yet.</p>
                         </div>
                     </div>
-                    <div id="jobDetail"></div>
-                </div>
-            </div>
 
-            <!-- =========================== User Pipeline Section =========================== -->
-            <div id="userPipelineSection" class="pipeline-section mt-3 user-only hidden">
-                <div class="card">
-                    <div class="card-header">
-                        <h2>Run My Extraction Pipeline</h2>
+                    <div id="jobDetailCard" class="card hidden">
+                        <div class="card-header">
+                            <h2>Job Detail: <span id="detailJobId">—</span></h2>
+                            <div class="card-actions">
+                                <span id="detailStatus" class="badge">—</span>
+                                <button class="btn btn-sm btn-warn hidden" id="jobPauseBtn" title="Pause active job">Pause</button>
+                                <button class="btn btn-sm btn-primary hidden" id="jobResumeBtn" title="Resume paused job">Resume</button>
+                                <button class="btn btn-sm btn-danger hidden" id="jobKillBtn" title="Kill / cancel job">Kill</button>
+                            </div>
+                        </div>
+                        <div id="adminJobProgress" class="job-progress hidden"></div>
+                        <div id="jobDetail"></div>
                     </div>
-                    <div class="form-row mt-1">
-                        <label for="userSchemaSelect">
-                            <strong>Target Schema</strong>
-                            <select id="userSchemaSelect" class="themed-select" style="width: 100%; padding: 8px 12px; border-radius: var(--radius-sm); background: var(--input-bg); color: var(--fg); border: 1px solid var(--border); font-size: 13px;">
+                </div>
+
+                <!-- =========================== User Pipeline Section =========================== -->
+                <div id="userPipelineSection" class="pipeline-section user-only hidden">
+                    <div class="card">
+                        <div class="card-header">
+                            <h2>Run My Extraction Pipeline</h2>
+                        </div>
+                        <div class="pipe-config-card">
+                            <label for="userSchemaSelect" class="l">Target Schema</label>
+                            <select id="userSchemaSelect">
                                 <option value="">— load your schemas —</option>
                             </select>
-                            <button class="btn btn-ghost btn-sm mt-1" id="refreshUserSchemasBtn" type="button">Refresh My Schemas</button>
-                        </label>
+                            <div>
+                                <button class="btn btn-ghost btn-sm" id="refreshUserSchemasBtn" type="button">Refresh My Schemas</button>
+                            </div>
+                        </div>
+                        <div class="pipeline-actions">
+                            <button class="btn btn-primary btn-lg btn-full" id="userAutoRunPipelineBtn">
+                                Run Pipeline on My Documents
+                            </button>
+                        </div>
+                        <div id="userAutoRunStatus" class="status-box hidden"></div>
                     </div>
-                    <div class="pipeline-actions mt-1">
-                        <button class="btn btn-primary btn-lg btn-full" id="userAutoRunPipelineBtn">
-                            Run Pipeline on My Documents
-                        </button>
+
+                    <div class="card">
+                        <div class="card-header">
+                            <h2>My Extraction Jobs</h2>
+                            <button class="btn btn-ghost btn-sm" id="refreshUserJobsBtn">Refresh</button>
+                        </div>
+                        <div id="userJobList">
+                            <p class="muted">No jobs yet.</p>
+                        </div>
                     </div>
-                    <div id="userAutoRunStatus" class="status-box hidden"></div>
+
+                    <div id="userJobDetailCard" class="card hidden">
+                        <div class="card-header">
+                            <h2>Job Detail: <span id="userDetailJobId">—</span></h2>
+                            <div class="card-actions">
+                                <span id="userDetailStatus" class="badge">—</span>
+                                <button class="btn btn-sm btn-warn hidden" id="userJobPauseBtn" title="Pause active job">Pause</button>
+                                <button class="btn btn-sm btn-primary hidden" id="userJobResumeBtn" title="Resume paused job">Resume</button>
+                                <button class="btn btn-sm btn-danger hidden" id="userJobKillBtn" title="Kill / cancel job">Kill</button>
+                            </div>
+                        </div>
+                        <div id="userJobProgress" class="job-progress hidden"></div>
+                        <div id="userJobDetail"></div>
+                    </div>
+                </div>
+            </section>
+
+            <!-- =========================== TAB: Shared Documents (Admin) =========================== -->
+            <section id="tab-documents" class="tab-panel admin-only">
+                <div class="page-head">
+                    <div>
+                        <h1>Shared Dataset</h1>
+                        <p class="s">PDFs available to every user, plus the outputs produced from them.</p>
+                    </div>
+                </div>
+
+                <div class="card">
+                    <h2>Upload Shared Documents</h2>
+                    <div class="upload-zone" id="uploadZone">
+                        <input type="file" id="fileInput" multiple accept="application/pdf,.pdf" hidden>
+                        <div class="upload-inner">
+                            <p class="upload-icon"></p>
+                            <p><strong>Drag &amp; drop PDFs here</strong> or <a href="#" id="browseBtn">browse</a></p>
+                        </div>
+                    </div>
+                    <div id="uploadStatus" class="status-box hidden"></div>
                 </div>
 
                 <div class="card">
                     <div class="card-header">
-                        <h2>My Extraction Jobs</h2>
-                        <button class="btn btn-ghost btn-sm" id="refreshUserJobsBtn">Refresh</button>
+                        <h2>Dataset (<span id="docCount">0</span>)</h2>
+                        <button class="btn btn-ghost btn-sm" id="refreshDocsBtn">Refresh</button>
                     </div>
-                    <div id="userJobList">
-                        <p class="muted">No jobs yet.</p>
+                    <div id="docList" class="doc-list">
+                        <p class="muted">Loading…</p>
                     </div>
                 </div>
 
-                <div id="userJobDetailCard" class="card hidden">
+                <div class="card ocr-docs-card">
                     <div class="card-header">
-                        <h2>Job Detail: <span id="userDetailJobId">—</span></h2>
-                        <div class="card-actions">
-                            <span id="userDetailStatus" class="badge">—</span>
-                            <button class="btn btn-sm btn-warn hidden" id="userJobPauseBtn" title="Pause active job">Pause</button>
-                            <button class="btn btn-sm btn-primary hidden" id="userJobResumeBtn" title="Resume paused job">Resume</button>
-                            <button class="btn btn-sm btn-danger hidden" id="userJobKillBtn" title="Kill / cancel job">Kill</button>
+                        <h2>OCR Documents (<span id="ocrDocCount">0</span>)</h2>
+                        <div class="card-actions ocr-docs-actions">
+                            <label class="ocr-owner-label" for="ocrOwner">Owner</label>
+                            <select id="ocrOwner" class="ocr-owner-select">
+                                <option value="">All owners</option>
+                            </select>
+                            <button class="btn btn-ghost btn-sm" id="ocrRefresh" type="button">Refresh</button>
                         </div>
                     </div>
-                    <div id="userJobDetail"></div>
+                    <p class="muted small ocr-docs-state" id="ocrState" aria-live="polite">Loading OCR documents&hellip;</p>
+                    <div class="ocr-table-wrap hidden" id="ocrWrap">
+                        <table class="ocr-table">
+                            <thead>
+                                <tr>
+                                    <th>Document</th>
+                                    <th class="ocr-col-owner">Owner</th>
+                                    <th class="ocr-col-num">Pages</th>
+                                    <th class="ocr-col-num">Size</th>
+                                    <th class="ocr-col-saved">Saved</th>
+                                    <th class="ocr-col-stored">Stored</th>
+                                    <th class="ocr-col-actions">Actions</th>
+                                </tr>
+                            </thead>
+                            <tbody id="ocrBody"></tbody>
+                        </table>
+                    </div>
+                    <section class="ocr-viewer hidden" id="ocrViewer" aria-labelledby="ocrViewerTitle">
+                        <div class="ocr-viewer-head">
+                            <div class="ocr-viewer-titles">
+                                <h3 id="ocrViewerTitle"></h3>
+                                <div class="ocr-viewer-meta" id="ocrViewerMeta"></div>
+                            </div>
+                            <button class="btn btn-ghost btn-sm" id="ocrViewerClose" type="button">Close</button>
+                        </div>
+                        <pre class="ocr-viewer-text" id="ocrViewerText" tabindex="0"></pre>
+                    </section>
                 </div>
-            </div>
-        </section>
-
-        <!-- =========================== TAB: Shared Documents (Admin) =========================== -->
-        <section id="tab-documents" class="tab-panel admin-only">
-            <div class="card">
-                <h2>Upload Shared Documents</h2>
-                <div class="upload-zone" id="uploadZone">
-                    <input type="file" id="fileInput" multiple accept="application/pdf,.pdf" hidden>
-                    <div class="upload-inner">
-                        <p class="upload-icon"></p>
-                        <p><strong>Drag &amp; drop PDFs here</strong> or <a href="#" id="browseBtn">browse</a></p>
+                <div class="card">
+                    <div class="card-header">
+                        <h2>Outputs (<span id="outCount">0</span>)</h2>
+                    </div>
+                    <div id="outList" class="doc-list">
+                        <p class="muted">Load documents first.</p>
                     </div>
                 </div>
-                <div id="uploadStatus" class="status-box hidden"></div>
-            </div>
+            </section>
 
-            <div class="card">
-                <div class="card-header">
-                    <h2>Dataset (<span id="docCount">0</span>)</h2>
-                    <button class="btn btn-ghost" id="refreshDocsBtn">Refresh</button>
-                </div>
-                <div id="docList" class="doc-list">
-                    <p class="muted">Loading…</p>
-                </div>
-            </div>
-
-            <div class="card">
-                <div class="card-header">
-                    <h2>Outputs (<span id="outCount">0</span>)</h2>
-                </div>
-                <div id="outList" class="doc-list">
-                    <p class="muted">Load documents first.</p>
-                </div>
-            </div>
-        </section>
-
-        <!-- =========================== TAB: My Documents (User Only) =========================== -->
-        <section id="tab-user-documents" class="tab-panel user-only hidden">
-            <div class="card">
-                <h2>Upload My Documents</h2>
-                <div class="upload-zone" id="userUploadZone">
-                    <input type="file" id="userFileInput" multiple accept="application/pdf,.pdf" hidden>
-                    <div class="upload-inner">
-                        <p class="upload-icon"></p>
-                        <p><strong>Drag &amp; drop PDFs here</strong> or <a href="#" id="userBrowseBtn">browse</a></p>
-                    </div>
-                </div>
-                <div id="userUploadStatus" class="status-box hidden"></div>
-            </div>
-
-            <div class="card">
-                <div class="card-header">
-                    <h2>My Documents (<span id="userDocCount">0</span>)</h2>
-                    <button class="btn btn-ghost" id="refreshUserDocsBtn">Refresh</button>
-                </div>
-                <div id="userDocList" class="doc-list">
-                    <p class="muted">Loading…</p>
-                </div>
-            </div>
-
-            <div class="card">
-                <div class="card-header">
-                    <h2>Outputs (<span id="userOutCount">0</span>)</h2>
-                    <button class="btn btn-ghost btn-sm" id="refreshUserOutputsBtn">Refresh</button>
-                </div>
-                <div id="userOutList" class="doc-list">
-                    <p class="muted">No processed outputs yet. Run the pipeline.</p>
-                </div>
-            </div>
-        </section>
-
-        <!-- =========================== TAB: Logs (Admin Only) =========================== -->
-        <section id="tab-logs" class="tab-panel admin-only">
-            <div class="card">
-                <div class="card-header">
-                    <h2>System &amp; User Activity Logs</h2>
-                    <div class="card-actions">
-                        <button class="btn btn-primary btn-sm" id="logSubTabUsersBtn">User Activity</button>
-                        <button class="btn btn-outline btn-sm" id="logSubTabSystemBtn">System Logs</button>
-                        <button class="btn btn-ghost btn-sm" id="refreshLogsBtn">Refresh</button>
+            <!-- =========================== TAB: My Documents (User Only) =========================== -->
+            <section id="tab-user-documents" class="tab-panel user-only hidden">
+                <div class="page-head">
+                    <div>
+                        <h1>My Documents</h1>
+                        <p class="s">Your private PDFs and the outputs produced from them.</p>
                     </div>
                 </div>
 
-                <!-- User Activity Sub-Panel -->
-                <div id="userLogsPanel">
-                    <div class="form-row" style="display: flex; gap: 8px; align-items: center; max-width: 480px; margin-bottom: 12px;">
-                        <input type="text" id="logFilterUsername" placeholder="Filter by username (e.g. admin)..." style="flex: 1;">
-                        <button class="btn btn-primary btn-sm" id="applyLogFilterBtn">Filter</button>
-                        <button class="btn btn-ghost btn-sm" id="clearLogFilterBtn">Clear</button>
+                <div class="card">
+                    <h2>Upload My Documents</h2>
+                    <div class="upload-zone" id="userUploadZone">
+                        <input type="file" id="userFileInput" multiple accept="application/pdf,.pdf" hidden>
+                        <div class="upload-inner">
+                            <p class="upload-icon"></p>
+                            <p><strong>Drag &amp; drop PDFs here</strong> or <a href="#" id="userBrowseBtn">browse</a></p>
+                        </div>
                     </div>
-                    <div id="userLogsList" class="logs-container">
-                        <p class="muted">Loading user logs...</p>
+                    <div id="userUploadStatus" class="status-box hidden"></div>
+                </div>
+
+                <div class="card">
+                    <div class="card-header">
+                        <h2>My Documents (<span id="userDocCount">0</span>)</h2>
+                        <button class="btn btn-ghost btn-sm" id="refreshUserDocsBtn">Refresh</button>
+                    </div>
+                    <div id="userDocList" class="doc-list">
+                        <p class="muted">Loading…</p>
                     </div>
                 </div>
 
-                <!-- System Logs Sub-Panel -->
-                <div id="systemLogsPanel" class="hidden">
-                    <div id="systemLogsList" class="logs-container log-terminal">
-                        <p class="muted">Loading system logs...</p>
+                <div class="card ocr-docs-card">
+                    <div class="card-header">
+                        <h2>OCR Documents (<span id="userOcrDocCount">0</span>)</h2>
+                        <div class="card-actions ocr-docs-actions">
+                            <button class="btn btn-ghost btn-sm" id="userOcrRefresh" type="button">Refresh</button>
+                        </div>
+                    </div>
+                    <p class="muted small ocr-docs-state" id="userOcrState" aria-live="polite">Loading OCR documents&hellip;</p>
+                    <div class="ocr-table-wrap hidden" id="userOcrWrap">
+                        <table class="ocr-table">
+                            <thead>
+                                <tr>
+                                    <th>Document</th>
+                                    <th class="ocr-col-num">Pages</th>
+                                    <th class="ocr-col-num">Size</th>
+                                    <th class="ocr-col-saved">Saved</th>
+                                    <th class="ocr-col-stored">Stored</th>
+                                    <th class="ocr-col-actions">Actions</th>
+                                </tr>
+                            </thead>
+                            <tbody id="userOcrBody"></tbody>
+                        </table>
+                    </div>
+                    <section class="ocr-viewer hidden" id="userOcrViewer" aria-labelledby="userOcrViewerTitle">
+                        <div class="ocr-viewer-head">
+                            <div class="ocr-viewer-titles">
+                                <h3 id="userOcrViewerTitle"></h3>
+                                <div class="ocr-viewer-meta" id="userOcrViewerMeta"></div>
+                            </div>
+                            <button class="btn btn-ghost btn-sm" id="userOcrViewerClose" type="button">Close</button>
+                        </div>
+                        <pre class="ocr-viewer-text" id="userOcrViewerText" tabindex="0"></pre>
+                    </section>
+                </div>
+                <div class="card">
+                    <div class="card-header">
+                        <h2>Outputs (<span id="userOutCount">0</span>)</h2>
+                        <button class="btn btn-ghost btn-sm" id="refreshUserOutputsBtn">Refresh</button>
+                    </div>
+                    <div id="userOutList" class="doc-list">
+                        <p class="muted">No processed outputs yet. Run the pipeline.</p>
                     </div>
                 </div>
-            </div>
-        </section>
+            </section>
 
-        <!-- =========================== TAB: User Management (Admin Only) =========================== -->
-        <section id="tab-users" class="tab-panel admin-only">
-            <div class="card">
-                <div class="card-header">
-                    <h2>Create User Account</h2>
+            <!-- =========================== TAB: Logs (Admin Only) =========================== -->
+            <section id="tab-logs" class="tab-panel admin-only">
+                <div class="page-head">
+                    <div>
+                        <h1>Logs</h1>
+                        <p class="s">User activity and system logs.</p>
+                    </div>
                 </div>
-                <form id="createUserForm" style="max-width: 480px;">
-                    <div class="form-row">
-                        <label for="newUsername">Username</label>
-                        <input type="text" id="newUsername" placeholder="username" required>
+
+                <div class="card">
+                    <div class="card-header">
+                        <h2>System &amp; User Activity Logs</h2>
+                        <div class="card-actions">
+                            <button class="btn btn-primary btn-sm" id="logSubTabUsersBtn">User Activity</button>
+                            <button class="btn btn-outline btn-sm" id="logSubTabSystemBtn">System Logs</button>
+                            <button class="btn btn-ghost btn-sm" id="refreshLogsBtn">Refresh</button>
+                        </div>
                     </div>
-                    <div class="form-row">
-                        <label for="newPassword">Password</label>
-                        <input type="password" id="newPassword" placeholder="password" required>
+
+                    <!-- User Activity Sub-Panel -->
+                    <div id="userLogsPanel">
+                        <div class="log-filter-row">
+                            <input type="text" id="logFilterUsername" placeholder="Filter by username (e.g. admin)...">
+                            <button class="btn btn-primary btn-sm" id="applyLogFilterBtn">Filter</button>
+                            <button class="btn btn-ghost btn-sm" id="clearLogFilterBtn">Clear</button>
+                        </div>
+                        <div id="userLogsList" class="logs-container">
+                            <p class="muted">Loading user logs...</p>
+                        </div>
                     </div>
-                    <div class="form-row">
-                        <label for="newRole">Role</label>
-                        <select id="newRole">
-                            <option value="user" selected>user</option>
-                            <option value="admin">admin</option>
+
+                    <!-- System Logs Sub-Panel -->
+                    <div id="systemLogsPanel" class="hidden">
+                        <div id="systemLogsList" class="logs-container log-terminal">
+                            <p class="muted">Loading system logs...</p>
+                        </div>
+                    </div>
+                </div>
+            </section>
+
+            <!-- =========================== TAB: User Management (Admin Only) =========================== -->
+            <section id="tab-users" class="tab-panel admin-only">
+                <div class="page-head">
+                    <div>
+                        <h1>User Management</h1>
+                        <p class="s">Create accounts and review who has access to the console.</p>
+                    </div>
+                </div>
+
+                <div class="card">
+                    <div class="card-header">
+                        <h2>Create User Account</h2>
+                    </div>
+                    <form id="createUserForm" class="login-form">
+                        <div class="form-row">
+                            <label for="newUsername">Username</label>
+                            <input type="text" id="newUsername" placeholder="username" required>
+                        </div>
+                        <div class="form-row">
+                            <label for="newPassword">Password</label>
+                            <input type="password" id="newPassword" placeholder="password" required>
+                        </div>
+                        <div class="form-row">
+                            <label for="newRole">Role</label>
+                            <select id="newRole">
+                                <option value="user" selected>user</option>
+                                <option value="admin">admin</option>
+                            </select>
+                        </div>
+                        <button type="submit" id="createUserBtn" class="btn btn-primary">Create Account</button>
+                        <div id="createUserStatus" class="status-box hidden"></div>
+                    </form>
+                </div>
+
+                <div class="card">
+                    <div class="card-header">
+                        <h2>System Users</h2>
+                        <button class="btn btn-ghost btn-sm" id="refreshUsersListBtn">Refresh</button>
+                    </div>
+                    <div id="usersListTable">
+                        <p class="muted">Loading users...</p>
+                    </div>
+                </div>
+            </section>
+
+            <!-- =========================== TAB: Query Bot =========================== -->
+            <section id="tab-querybot" class="tab-panel">
+                <div class="page-head">
+                    <div>
+                        <h1>Query Bot</h1>
+                        <p class="s">Ask questions about the extracted document data.</p>
+                    </div>
+                </div>
+
+                <div class="card">
+                    <div class="card-header">
+                        <h2>Query Bot</h2>
+                        <div class="card-actions">
+                            <button class="btn btn-ghost btn-sm" id="qbClearBtn">Clear Chat</button>
+                        </div>
+                    </div>
+
+                    <!-- Document Scope Selector -->
+                    <div class="query-scope">
+                        <label for="tab_qb_doc_select" class="l">Document Scope</label>
+                        <select id="tab_qb_doc_select" class="form-control">
+                            <option value="">-- Select Active Document --</option>
                         </select>
+                        <span id="tab_qb_mode_badge" class="badge" style="display: none;"></span>
                     </div>
-                    <button type="submit" id="createUserBtn" class="btn btn-primary">Create Account</button>
-                    <div id="createUserStatus" class="status-box hidden"></div>
-                </form>
-            </div>
 
-            <div class="card">
-                <div class="card-header">
-                    <h2>System Users</h2>
-                    <button class="btn btn-ghost btn-sm" id="refreshUsersListBtn">Refresh</button>
-                </div>
-                <div id="usersListTable">
-                    <p class="muted">Loading users...</p>
-                </div>
-            </div>
-        </section>
-        <!-- =========================== TAB: Query Bot (Admin Only) =========================== -->
-        <section id="tab-querybot" class="tab-panel">
-            <div class="card">
-                <div class="card-header">
-                    <h2>Query Bot</h2>
-                    <div class="card-actions">
-                        <button class="btn btn-ghost btn-sm" id="qbClearBtn">Clear Chat</button>
+                    <!-- Chat window -->
+                    <div class="query-bot-container">
+                        <div class="query-bot-messages" id="tab_qb_msgs">
+                            <div class="query-bot-msg bot">Hi! Ask me anything about the extracted document data.</div>
+                        </div>
+                        <div class="query-bot-input-row">
+                            <input type="text" class="query-bot-input" id="tab_qb_input"
+                                placeholder="Ask a question about the extracted JSON..."
+                                autocomplete="off">
+                            <button type="button" class="query-bot-send-btn" id="tab_qb_btn">Ask Bot</button>
+                        </div>
                     </div>
                 </div>
+            </section>
+        </main>
+    </div>
 
-                <!-- Document Scope Selector -->
-                <div style="margin: 0 0 14px 0; display: flex; align-items: center; gap: 10px; flex-wrap: wrap;">
-                    <label for="tab_qb_doc_select" style="font-weight: 600; font-size: 13px; color: var(--fg-muted, #888);">Document Scope:</label>
-                    <select id="tab_qb_doc_select" class="form-control" style="flex: 1; min-width: 240px; max-width: 440px; padding: 6px 12px; border-radius: 6px; font-size: 13px;">
-                        <option value="">-- Select Active Document --</option>
-                    </select>
-                    <span id="tab_qb_mode_badge" class="badge" style="font-size: 11px; display: none;"></span>
-                </div>
-
-                <!-- Chat window -->
-                <div class="query-bot-container">
-                    <div class="query-bot-messages" id="tab_qb_msgs">
-                        <div class="query-bot-msg bot">Hi! Ask me anything about the extracted document data.</div>
-                    </div>
-                    <div class="query-bot-input-row">
-                        <input type="text" class="query-bot-input" id="tab_qb_input"
-                            placeholder="Ask a question about the extracted JSON..."
-                            autocomplete="off">
-                        <button type="button" class="query-bot-send-btn" id="tab_qb_btn">Ask Bot</button>
-                    </div>
-                </div>
-            </div>
-        </section>
-    </main>
-
-    <script src="app.js?v=27"></script>
+    <script src="app.js?v=33"></script>
 </body>
 </html>

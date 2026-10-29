@@ -18,7 +18,7 @@ Deps: pydantic
 """
 import os
 import time
-from typing import Any, Optional
+from typing import Any, Callable, Optional
 
 from src.adapters.llm.base import LLMClient
 from src.ai.layer1_routing.inspect import inspect_page
@@ -752,6 +752,8 @@ def process_document(
     overwrite: bool = True,
     extraction_requirements: dict | None = None,
     ir_owner: str | None = None,
+    *,
+    on_page_complete: Callable[[int], None] | None = None,
 ) -> list[tuple[PageOutput, PageMetadata]]:
     """
     Process every page in a document.
@@ -764,10 +766,25 @@ def process_document(
     If write_output=True and output_dir is set, the merged per-document
     markdown is written to <output_dir>/<document_stem>.md via md_writer.
 
+    If on_page_complete is given, it is called with the page number after each
+    page finishes. It may run on worker threads. Its errors are logged and ignored.
+
     Returns a list of (PageOutput, PageMetadata) pairs, one per page.
     """
     results: list[tuple[PageOutput, PageMetadata]] = []
     concurrency_limit = max(1, getattr(settings, "page_concurrency_limit", 25))
+
+    def _notify_page_complete(page_number: int) -> None:
+        if on_page_complete is None:
+            return
+        try:
+            on_page_complete(page_number)
+        except Exception as exc:  # progress reporting must never fail OCR
+            logger.warning(
+                "pipeline.page_progress_callback_failed",
+                page_number=page_number,
+                error=str(exc),
+            )
 
     # ── Layer 1.5 per-document probe (flag-guarded, default-OFF) ─────────────
     # When settings.probe_enabled and at least one page needs probing, run the
@@ -792,11 +809,12 @@ def process_document(
                 extraction_requirements=page_data.get("extraction_requirements", extraction_requirements),
             )
             results.append((output, metadata))
+            _notify_page_complete(page_data["page_number"])
     else:
         from concurrent.futures import ThreadPoolExecutor
 
         def _worker(page_data: dict) -> tuple[PageOutput, PageMetadata]:
-            return process_page(
+            pair = process_page(
                 page=page_data["page"],
                 page_number=page_data["page_number"],
                 page_context=page_data["context"],
@@ -806,6 +824,8 @@ def process_document(
                 document_id=document_id,
                 extraction_requirements=page_data.get("extraction_requirements", extraction_requirements),
             )
+            _notify_page_complete(page_data["page_number"])
+            return pair
 
         max_workers = min(len(pages), concurrency_limit)
         logger.info(
