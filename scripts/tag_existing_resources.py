@@ -3,7 +3,7 @@ File: tag_existing_resources.py
 Purpose: Apply standard tags across all IDP AWS resources in account 106611079163.
 Tags:
   createdby=vinay.k@shellkode.com
-  customer=internal
+  customer=idp-internal-35385
   purpose=internal
 """
 import argparse
@@ -15,7 +15,7 @@ DEFAULT_PROFILE = "106611079163_SK-ML-Sandbox-team-Ps"
 DEFAULT_REGION = "ap-south-1"
 DEFAULT_TAGS = {
     "createdby": "vinay.k@shellkode.com",
-    "customer": "internal",
+    "customer": "idp-internal-35385",
     "purpose": "internal",
 }
 

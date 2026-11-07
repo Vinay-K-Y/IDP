@@ -29,7 +29,7 @@ except Exception:  # pragma: no cover
     DEFAULT_CLUSTER = "idp-cluster"
     DEFAULT_SERVICE = "idp-layer3-service"
     ECS_TAGS = [
-        {"key": "createdby", "value": "vinay.k@shellkode"},
+        {"key": "createdby", "value": "vinay.k@shellkode.com"},
         {"key": "purpose", "value": "internal"},
         {"key": "customer", "value": "idp-internal-35385"},
     ]

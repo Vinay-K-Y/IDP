@@ -123,7 +123,7 @@ def test_assert_not_latest_rejects_latest_image():
 
 def test_ecs_tags_are_mandatory_agents_tags():
     keys = {t["key"]: t["value"] for t in ds.ECS_TAGS}
-    assert keys["createdby"] == "vinay.k@shellkode"
+    assert keys["createdby"] == "vinay.k@shellkode.com"
     assert keys["purpose"] == "internal"
     assert keys["customer"] == "idp-internal-35385"
 

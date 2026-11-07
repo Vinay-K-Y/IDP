@@ -3,7 +3,7 @@ File: deploy_aws_postgres.py
 Purpose: Provision and configure an AWS RDS PostgreSQL database for the IDP system.
 Tags applied to all created resources:
   createdby=vinay.k@shellkode.com
-  customer=internal
+  customer=idp-internal-35385
   purpose=internal
 """
 import argparse
@@ -27,7 +27,7 @@ DEFAULT_INSTANCE_CLASS = "db.t4g.micro"
 
 MANDATORY_TAGS = [
     {"Key": "createdby", "Value": "vinay.k@shellkode.com"},
-    {"Key": "customer", "Value": "internal"},
+    {"Key": "customer", "Value": "idp-internal-35385"},
     {"Key": "purpose", "Value": "internal"},
 ]
 

@@ -4,7 +4,7 @@ Purpose: Complete deployment of IDP Layer 3 Web Console & Chatbot to AWS ECS Far
          behind an Application Load Balancer (ALB) with mandatory resource tagging.
 Tags:
   createdby=vinay.k@shellkode.com
-  customer=internal
+  customer=idp-internal-35385
   purpose=internal
 """
 import argparse
@@ -31,7 +31,7 @@ TG_NAME = "idp-web-tg"
 
 DEFAULT_TAGS = {
     "createdby": "vinay.k@shellkode.com",
-    "customer": "internal",
+    "customer": "idp-internal-35385",
     "purpose": "internal",
 }
 
@@ -47,7 +47,7 @@ def run_command(cmd, cwd=None):
 
 
 def parse_tags(tags_str: str | None) -> dict[str, str]:
-    raw = tags_str or os.getenv("IDP_AWS_TAGS") or "createdby=vinay.k@shellkode.com,customer=internal,purpose=internal"
+    raw = tags_str or os.getenv("IDP_AWS_TAGS") or "createdby=vinay.k@shellkode.com,customer=idp-internal-35385,purpose=internal"
     tags = {}
     for part in raw.strip().split(","):
         if "=" in part:
@@ -475,7 +475,7 @@ def main():
     parser.add_argument("--region", default=os.getenv("AWS_REGION", DEFAULT_REGION))
     parser.add_argument(
         "--tags",
-        default="createdby=vinay.k@shellkode.com,customer=internal,purpose=internal",
+        default="createdby=vinay.k@shellkode.com,customer=idp-internal-35385,purpose=internal",
         help="Comma-separated tags e.g. 'createdby=...,customer=...,purpose=...'",
     )
     parser.add_argument("--skip-build", action="store_true", help="Skip Docker build and push")

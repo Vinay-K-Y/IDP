@@ -108,7 +108,7 @@ def register_task_definition(ecs_client, task_def_path: Path) -> str:
         containerDefinitions=task_def_data["containerDefinitions"],
         tags=[
             {"key": "createdby", "value": "vinay.k@shellkode.com"},
-            {"key": "customer", "value": "internal"},
+            {"key": "customer", "value": "idp-internal-35385"},
             {"key": "purpose", "value": "internal"},
         ],
     )
@@ -159,7 +159,7 @@ def deploy_ecs_service(
         },
         tags=[
             {"key": "createdby", "value": "vinay.k@shellkode.com"},
-            {"key": "customer", "value": "internal"},
+            {"key": "customer", "value": "idp-internal-35385"},
         ],
     )
     svc_arn = create_resp["service"]["serviceArn"]

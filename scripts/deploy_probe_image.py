@@ -64,7 +64,7 @@ BUILD_FLAGS = "--provenance=false"             # deploy_idp_ecr_images.py:90
 # AGENTS.md mandatory tags (ECR TagResource uses Key/Value capitalisation,
 # mirroring deploy_idp_ecr_images.py:25-29 TAGS).
 MANDATORY_TAGS = [
-    {"Key": "createdby", "Value": "vinay.k@shellkode"},
+    {"Key": "createdby", "Value": "vinay.k@shellkode.com"},
     {"Key": "purpose", "Value": "internal"},
     {"Key": "customer", "Value": "idp-internal-35385"},
 ]
