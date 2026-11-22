@@ -352,9 +352,15 @@ def process_page(
     document_name: str = "",
     document_id: str = "",
     extraction_requirements: dict | None = None,
+    *,
+    on_stage: Callable[[int | None, str], None] | None = None,
 ) -> tuple[PageOutput, PageMetadata]:
     """
     Full pipeline for one page. Returns (PageOutput, PageMetadata).
+
+    on_stage, if given, is called as on_stage(page_number, stage) with stage
+    'inspect_done', 'route_done' and 'ocr_start'. It may run on worker threads.
+    Its errors are logged and ignored.
 
     PageOutput  — the contract handed to Engineer B's Layer 3 (unchanged).
     PageMetadata — the complete internal audit trail for this page.
@@ -390,6 +396,8 @@ def process_page(
 
     # ── Step 1: inspect ─────────────────────────────────────────────────────
     profile = inspect_page(page, page_number)
+    t_inspect_done = time.monotonic()
+    _emit_stage(on_stage, page_number, "inspect_done")
 
     metadata.char_count       = profile.char_count
     metadata.image_coverage   = profile.image_coverage
@@ -445,6 +453,8 @@ def process_page(
         metadata.add_capability(cap)
 
     primary_task = plan[0] if plan else None
+    t_route_done = time.monotonic()
+    _emit_stage(on_stage, page_number, "route_done")
 
     # ── Layer 1.5 probe seam ─────────────────────────────────────────────────
     # Per-document probe (process_document) wins: when a 'probe' decision was
@@ -475,7 +485,10 @@ def process_page(
     )
 
     # ── Step 5 + 6: run plan and merge ──────────────────────────────────────
+    _emit_stage(on_stage, page_number, "ocr_start")
+    t_ocr_start = time.monotonic()
     raw_results = _run_plan(plan, page_context, llm_client)
+    t_ocr_done = time.monotonic()
 
     # Record each engine result in metadata and collect blocks
     page_blocks = []
@@ -635,6 +648,11 @@ def process_page(
         escalated=output.escalated,
         low_confidence=output.low_confidence,
         total_latency_ms=round(total_latency_ms, 1),
+        # Per-stage timing. probe_ms is per document and is logged by process_document.
+        inspect_ms=round((t_inspect_done - page_start) * 1000, 1),
+        route_ms=round((t_route_done - t_inspect_done) * 1000, 1),
+        ocr_ms=round((t_ocr_done - t_ocr_start) * 1000, 1),
+        post_ocr_ms=round((time.monotonic() - t_ocr_done) * 1000, 1),  # merge, escalation ladder, metadata
     )
 
     # ── Additive probe observability (flag-agnostic; fires ONLY when a probe
@@ -742,6 +760,16 @@ def _run_document_probe(pages: list[dict], document_id: str = "") -> None:
         }
 
 
+def _emit_stage(on_stage: Callable[[int | None, str], None] | None, page_number: int | None, stage: str) -> None:
+    """Report a stage change. Progress reporting must never fail OCR."""
+    if on_stage is None:
+        return
+    try:
+        on_stage(page_number, stage)
+    except Exception as exc:
+        logger.warning("pipeline.stage_callback_failed", page_number=page_number, stage=stage, error=str(exc))
+
+
 def process_document(
     pages: list[dict],
     llm_client: LLMClient,
@@ -754,6 +782,7 @@ def process_document(
     ir_owner: str | None = None,
     *,
     on_page_complete: Callable[[int], None] | None = None,
+    on_stage: Callable[[int | None, str], None] | None = None,
 ) -> list[tuple[PageOutput, PageMetadata]]:
     """
     Process every page in a document.
@@ -768,6 +797,10 @@ def process_document(
 
     If on_page_complete is given, it is called with the page number after each
     page finishes. It may run on worker threads. Its errors are logged and ignored.
+
+    If on_stage is given, it is called with (page_number, stage) for the probe
+    stages (page_number None) and for each page's inspect_done, route_done and
+    ocr_start stages. The caller records the ocr_done stage in on_page_complete.
 
     Returns a list of (PageOutput, PageMetadata) pairs, one per page.
     """
@@ -794,7 +827,12 @@ def process_document(
     # routable probed pages only. With the flag OFF this block is a no-op and the
     # pipeline is byte-identical to before.
     if settings.probe_enabled:
+        _emit_stage(on_stage, None, "probe_start")
+        t_probe0 = time.monotonic()
         _run_document_probe(pages, document_id)
+        _emit_stage(on_stage, None, "probe_done")
+        logger.info("pipeline.document_probe_timing", document=document_name,
+                    probe_ms=round((time.monotonic() - t_probe0) * 1000, 1))
 
     if len(pages) <= 1 or concurrency_limit == 1:
         for page_data in pages:
@@ -807,6 +845,7 @@ def process_document(
                 document_name=document_name,
                 document_id=document_id,
                 extraction_requirements=page_data.get("extraction_requirements", extraction_requirements),
+                on_stage=on_stage,
             )
             results.append((output, metadata))
             _notify_page_complete(page_data["page_number"])
@@ -823,6 +862,7 @@ def process_document(
                 document_name=document_name,
                 document_id=document_id,
                 extraction_requirements=page_data.get("extraction_requirements", extraction_requirements),
+                on_stage=on_stage,
             )
             _notify_page_complete(page_data["page_number"])
             return pair

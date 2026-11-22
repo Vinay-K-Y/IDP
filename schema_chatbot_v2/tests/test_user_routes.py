@@ -147,22 +147,8 @@ def test_user_job_isolation_and_controls(client):
     assert resp_y.status_code == 200
     assert not any(j["job_id"] == job_id for j in resp_y.json()["jobs"])
 
-    # User Y tries to pause/resume/kill user_x's job - should return 404 (not 403, don't leak existence)
-    assert client.post(f"/me/pipeline/jobs/{job_id}/pause", headers=auth_y).status_code == 404
-    assert client.post(f"/me/pipeline/jobs/{job_id}/resume", headers=auth_y).status_code == 404
+    # User Y tries to kill user_x's job - should return 404 (not 403, don't leak existence)
     assert client.post(f"/me/pipeline/jobs/{job_id}/kill", headers=auth_y).status_code == 404
-
-    # User X pauses their own job
-    pause_resp = client.post(f"/me/pipeline/jobs/{job_id}/pause", headers=auth_x)
-    assert pause_resp.status_code == 200
-    assert pause_resp.json()["status"] == "paused"
-    assert not ctrl.pause_event.is_set()
-
-    # User X resumes their own job
-    resume_resp = client.post(f"/me/pipeline/jobs/{job_id}/resume", headers=auth_x)
-    assert resume_resp.status_code == 200
-    assert resume_resp.json()["status"] == "running"
-    assert ctrl.pause_event.is_set()
 
     # User X kills their own job
     kill_resp = client.post(f"/me/pipeline/jobs/{job_id}/kill", headers=auth_x)

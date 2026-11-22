@@ -44,6 +44,7 @@ def _seed_graph(doc_id: str, owner: str | None):
         rec = DocumentGraphRecord(
             doc_id=doc_id,
             owner=owner,
+            node_count=1,
             graph_json={
                 "nodes": [{"id": "n1", "label": "Invoice", "value": "100", "source_pages": [1]}],
                 "edges": [],

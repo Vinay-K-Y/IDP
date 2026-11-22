@@ -6,9 +6,12 @@ Purpose: Bounded, cycle-safe Graph Query Service for Layer 3 Graph Memory.
 from __future__ import annotations
 
 import re
-from collections import deque
+import time
+from collections import Counter, deque
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional, Set, Tuple
+from decimal import Decimal, InvalidOperation
+from typing import Any, Callable, Dict, List, Optional, Set, Tuple
 
 from src.ai.layer3_extraction.graph_agent.graph_memory import GraphMemory
 from src.ai.layer3_extraction.graph_agent.models import GraphEdge, GraphNode
@@ -31,6 +34,36 @@ DEFAULT_VECTOR_MIN_SCORE = getattr(settings, "graph_query_vector_min_score", 0.3
 # Cap on the MERGED seed set so downstream BFS bounds stay as before.
 DEFAULT_MAX_SEEDS = getattr(settings, "graph_query_max_seeds", 10)
 
+# Chunk caps for ordinary questions (evidence spans and sources in the LLM context).
+QUERY_MAX_EVIDENCE = 16
+QUERY_MAX_SOURCES = 8
+
+# Itemised / total questions. Every evidence span on the summary pages goes into the
+# context, up to these caps, so the category rows are not cut by top-k.
+ITEMISED_INTENT_WORDS = frozenset({
+    "total", "summary", "itemised", "itemized", "bill", "breakdown", "amount", "charges",
+})
+ITEMISED_MAX_PAGES = 4
+ITEMISED_MAX_SPANS = 200
+ITEMISED_MAX_NODES = 120
+
+# Concurrent retrieval: keyword seeds and vector seeds are independent.
+RETRIEVAL_WORKERS = 2
+
+# Pages whose evidence mentions a total or summary term are treated as summary pages.
+SUMMARY_TEXT_RE = re.compile(r"\b(total|net|payable|summary|breakdown|itemi[sz]ed)\b", re.IGNORECASE)
+# One summary row: "<label> <col> <amount>", e.g. "BED CHARGES 0.00 30,950.00".
+SUMMARY_ROW_RE = re.compile(
+    r"^(?P<label>[A-Za-z][A-Za-z .&/()'-]{1,60}?)\s+(?P<first>-?[\d,]+\.\d{2})\s+(?P<amount>-?[\d,]+\.\d{2})$"
+)
+# Rows that are subtotals or header/meta text, not billable categories.
+SUMMARY_ROW_EXCLUDE_RE = re.compile(
+    r"\b(total|net|payable|balance|due|advance|deposit|copay|gst|tax|discount|paid|amount|spnr|spur)\b",
+    re.IGNORECASE,
+)
+STATED_TOTAL_RE = re.compile(r"^total bill amount\b", re.IGNORECASE)
+AMOUNT_TOKEN_RE = re.compile(r"-?\d[\d,]*\.\d{2}")
+
 STOP_WORDS = {
     "a", "an", "the", "is", "was", "are", "were", "be", "been", "being",
     "have", "has", "had", "do", "does", "did", "to", "at", "in", "for",
@@ -40,6 +73,156 @@ STOP_WORDS = {
     "tell", "me", "find", "give", "show", "can", "could", "would", "should",
     "of", "and", "or", "underwent", "performed", "recorded", "happened",
 }
+
+
+def is_itemised_question(question: str) -> bool:
+    """True when the question asks for a total, bill breakdown or itemised amounts."""
+    words = re.findall(r"[a-z]+", question.lower())
+    return any(w in ITEMISED_INTENT_WORDS for w in words)
+
+
+def find_summary_pages(graph: GraphMemory, limit: int = ITEMISED_MAX_PAGES) -> List[int]:
+    """Pages whose evidence mentions total or summary terms, ranked by hit count and
+    returned in page order. Real pages come from the graph; nothing is hard-coded."""
+    hits: Counter = Counter()
+    texts: List[Tuple[int, str]] = []
+    for node in graph._nodes.values():
+        for ev in node.evidence or []:
+            texts.append((int(ev.page_number), ev.text or ""))
+    for edge in graph._edges.values():
+        if edge.evidence:
+            texts.append((int(edge.source_page), edge.evidence))
+    for page, text in texts:
+        if SUMMARY_TEXT_RE.search(text):
+            hits[page] += 1
+        # A "LABEL 0.00 amount" row is strong evidence of a bill table.
+        if SUMMARY_ROW_RE.match(text.strip()):
+            hits[page] += 2
+    ranked = sorted(hits.items(), key=lambda kv: (-kv[1], kv[0]))
+    return sorted(page for page, _count in ranked[:limit])
+
+
+def collect_summary_spans(graph: GraphMemory, pages: List[int]) -> List[Tuple[int, str]]:
+    """Every distinct evidence span on the given pages, in page order (node and edge evidence)."""
+    wanted = set(pages)
+    spans: List[Tuple[int, str]] = []
+    seen: Set[Tuple[int, str]] = set()
+
+    def _add(page: int, text: str) -> None:
+        clean = (text or "").strip()
+        key = (page, _normalize_text(clean))
+        if clean and key not in seen and len(spans) < ITEMISED_MAX_SPANS:
+            seen.add(key)
+            spans.append((page, clean))
+
+    for node in graph._nodes.values():
+        for ev in node.evidence or []:
+            if int(ev.page_number) in wanted:
+                _add(int(ev.page_number), ev.text)
+    for edge in graph._edges.values():
+        if edge.evidence and int(edge.source_page) in wanted:
+            _add(int(edge.source_page), edge.evidence)
+    spans.sort(key=lambda s: s[0])
+    return spans
+
+
+def _normalize_text(text: str) -> str:
+    return re.sub(r"\s+", " ", text.strip().lower())
+
+
+def _parse_amount(text: str) -> Optional[Decimal]:
+    try:
+        return Decimal(text.replace(",", ""))
+    except (InvalidOperation, AttributeError):
+        return None
+
+
+def extract_summary_rows(spans: List[Tuple[int, str]]) -> List[Tuple[str, Decimal, int]]:
+    """Category rows ("LABEL 0.00 amount") from one summary table.
+    Rows are taken from a single page: the page with the most valid rows (lowest page on a tie),
+    so amounts from different tables are never mixed. Subtotal, tax and header rows are skipped.
+    The first row for each label on that page wins."""
+    per_page: Dict[int, List[Tuple[str, Decimal, int]]] = {}
+    seen_per_page: Dict[int, Set[str]] = {}
+    for page, text in spans:
+        m = SUMMARY_ROW_RE.match(text.strip())
+        if not m:
+            continue
+        label = " ".join(m.group("label").split())
+        seen = seen_per_page.setdefault(page, set())
+        if SUMMARY_ROW_EXCLUDE_RE.search(label) or label.lower() in seen:
+            continue
+        amount = _parse_amount(m.group("amount"))
+        if amount is None:
+            continue
+        seen.add(label.lower())
+        per_page.setdefault(page, []).append((label, amount, page))
+    if not per_page:
+        return []
+    best_page = max(per_page, key=lambda p: (len(per_page[p]), -p))
+    return per_page[best_page]
+
+
+def find_stated_total(spans: List[Tuple[int, str]], page: Optional[int] = None) -> Optional[Decimal]:
+    """The stated 'Total Bill Amount': the last amount on the first matching line.
+    Looks on `page` first when given, then on every summary span."""
+    ordered = [s for s in spans if s[0] == page] + [s for s in spans if s[0] != page] if page is not None else spans
+    for _p, text in ordered:
+        if STATED_TOTAL_RE.match(text.strip()):
+            found = AMOUNT_TOKEN_RE.findall(text)
+            if found:
+                return _parse_amount(found[-1])
+    return None
+
+
+def check_itemised_total(category_amounts: List[Any], stated_total: Any) -> Dict[str, Any]:
+    """Compares the sum of category amounts with the stated total.
+
+    Returns matched (True/False, or None when a side is missing), the sum, the stated
+    total, the difference (stated minus sum), and a plain-text note when they differ.
+    """
+    amounts = [a if isinstance(a, Decimal) else _parse_amount(str(a)) for a in category_amounts]
+    amounts = [a for a in amounts if a is not None]
+    stated = stated_total if isinstance(stated_total, Decimal) or stated_total is None else _parse_amount(str(stated_total))
+    total = sum(amounts, Decimal("0"))
+    if not amounts:
+        return {
+            "matched": None, "sum": None, "stated": _fmt(stated), "missing_amount": None, "rows": 0,
+            "missing_note": "The retrieved summary pages do not list the individual categories, so the breakdown is not available.",
+        }
+    if stated is None:
+        return {
+            "matched": None, "sum": _fmt(total), "stated": None, "missing_amount": None, "rows": len(amounts),
+            "missing_note": "The stated total was not found in the retrieved summary pages, so the categories cannot be checked against it.",
+        }
+    diff = stated - total
+    matched = abs(diff) < Decimal("0.01")
+    note = None
+    if not matched:
+        note = (
+            f"The category rows found in the retrieved pages sum to {total:,.2f}, which differs from the "
+            f"stated total of {stated:,.2f} by {diff:,.2f}. The breakdown is not fully detailed in the "
+            "retrieved pages, so one or more categories may be missing."
+        )
+    return {
+        "matched": matched, "sum": _fmt(total), "stated": _fmt(stated), "missing_amount": _fmt(diff),
+        "rows": len(amounts), "missing_note": note,
+    }
+
+
+def _fmt(value: Optional[Decimal]) -> Optional[str]:
+    return None if value is None else f"{value:.2f}"
+
+
+def dedupe_sources_by_page(sources: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """One source per page, sorted by page. The first snippet for a page is kept."""
+    by_page: Dict[int, Dict[str, Any]] = {}
+    for src in sources:
+        page = src.get("page")
+        if page is None:
+            continue
+        by_page.setdefault(int(page), src)
+    return [by_page[p] for p in sorted(by_page)]
 
 
 @dataclass
@@ -55,6 +238,10 @@ class GraphQueryResult:
     seed_sources: Dict[str, Any] = field(default_factory=dict)
     # Phase 4 Part 2 grounding verification (additive). Empty dict when not run.
     grounding: Dict[str, Any] = field(default_factory=dict)
+    # FEAT-003: per-stage timings in ms, itemised flag and programmatic total check.
+    timings: Dict[str, Any] = field(default_factory=dict)
+    itemised: bool = False
+    total_check: Dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -67,6 +254,9 @@ class GraphQueryResult:
             "mode": self.mode,
             "seed_sources": self.seed_sources,
             "grounding": self.grounding,
+            "timings": self.timings,
+            "itemised": self.itemised,
+            "total_check": self.total_check,
         }
 
 
@@ -594,6 +784,8 @@ class GraphQueryService:
         question: str,
         llm: Optional[ExtractionLLMClient] = None,
         verify_grounding: bool = True,
+        on_stage: Optional[Callable[[str], None]] = None,
+        on_token: Optional[Callable[[str], None]] = None,
     ) -> GraphQueryResult:
         """
         Execute a graph-backed query:
@@ -607,14 +799,35 @@ class GraphQueryService:
            never changes the answer text, only annotates it.
         """
         logger.info("graph.query.started", question=question)
+        timings: Dict[str, Any] = {}
+        total_start = time.perf_counter()
 
-        # Step 1a: Keyword seed-finding (existing, unchanged).
-        keyword_seeds = self.find_seed_nodes(graph, question)
+        def _emit(stage: str) -> None:
+            # Stage events let the caller stream progress. A failing callback never breaks the answer.
+            if on_stage is None:
+                return
+            try:
+                on_stage(stage)
+            except Exception as exc:
+                logger.warning("graph.query.on_stage_error", stage=stage, error=str(exc))
 
-        # Step 1b: Vector seed-finding (Phase 4, ADDITIVE). Semantic retrieval
-        # over evidence spans catches paraphrased questions the keyword path
-        # misses. Degrades to [] if the embedding model/index is unavailable.
-        vector_seeds = self.find_vector_seed_nodes(graph, question)
+        _emit("searching_graph")
+
+        # Step 1a + 1b: keyword and vector seed-finding run concurrently (independent).
+        # Vector retrieval degrades to [] if the embedding model/index is unavailable.
+        def _timed(fn: Callable[..., Any], *args: Any) -> Tuple[Any, float]:
+            t0 = time.perf_counter()
+            return fn(*args), (time.perf_counter() - t0) * 1000
+
+        retrieval_start = time.perf_counter()
+        with ThreadPoolExecutor(max_workers=RETRIEVAL_WORKERS) as pool:
+            fut_keyword = pool.submit(_timed, self.find_seed_nodes, graph, question)
+            fut_vector = pool.submit(_timed, self.find_vector_seed_nodes, graph, question)
+            keyword_seeds, timings["keyword_search_ms"] = fut_keyword.result()
+            vector_seeds, timings["vector_search_ms"] = fut_vector.result()
+        timings["retrieval_wall_ms"] = round((time.perf_counter() - retrieval_start) * 1000, 1)
+        timings["keyword_search_ms"] = round(timings["keyword_search_ms"], 1)
+        timings["vector_search_ms"] = round(timings["vector_search_ms"], 1)
 
         # Step 1c: Merge keyword + vector candidates (dedup by node id). Keyword
         # ordering is preserved first; vector-only hits are appended by score.
@@ -653,27 +866,68 @@ class GraphQueryService:
                 hops_traversed=0,
                 mode="graph",
                 seed_sources=seed_telemetry,
+                timings={**timings, "total_ms": round((time.perf_counter() - total_start) * 1000, 1)},
             )
 
-        # Step 2: Bounded Traversal
+        # Step 2: Bounded Traversal (hop, node and edge caps come from the constructor)
+        graph_start = time.perf_counter()
         nodes, edges, max_hop = self.traverse_subgraph(graph, seeds)
 
         # Step 3: Format compact evidence context & sources
-        context_text, sources = self.format_evidence_context(graph, nodes, edges)
+        itemised = is_itemised_question(question)
+        summary_pages: List[int] = []
+        summary_spans: List[Tuple[int, str]] = []
+        if itemised:
+            # Itemised intent: take every evidence span on the summary pages, not just top-k.
+            summary_pages = find_summary_pages(graph)
+            summary_spans = collect_summary_spans(graph, summary_pages)
+            nodes = self._add_summary_nodes(graph, nodes, summary_pages)
+        context_text, sources = self.format_evidence_context(
+            graph, nodes, edges,
+            max_evidence=QUERY_MAX_EVIDENCE,
+            max_sources=QUERY_MAX_SOURCES,
+        )
+        if itemised and summary_spans:
+            context_text, sources = self._append_summary_spans(context_text, sources, summary_pages, summary_spans)
+        timings["graph_search_ms"] = round((time.perf_counter() - graph_start) * 1000, 1)
+
+        # Programmatic total check on the category rows of the summary pages.
+        total_check: Dict[str, Any] = {}
+        if itemised:
+            rows = extract_summary_rows(summary_spans)
+            stated = find_stated_total(summary_spans, page=rows[0][2] if rows else None)
+            total_check = check_itemised_total([amt for _lbl, amt, _pg in rows], stated)
+            total_check["row_labels"] = [lbl for lbl, _amt, _pg in rows]
+            total_check["summary_pages"] = summary_pages
+            logger.info(
+                "graph.query.total_check",
+                matched=total_check.get("matched"), sum=total_check.get("sum"),
+                stated=total_check.get("stated"), rows=total_check.get("rows"),
+            )
+
+        _emit("reading_pages")
 
         # Step 4: Synthesize answer
-        answer = self._generate_answer(context_text, sources, nodes, question)
+        _emit("answering")
+        llm_start = time.perf_counter()
+        answer = self._generate_answer(
+            context_text, sources, nodes, question, itemised=itemised, on_token=on_token,
+        )
+        timings["llm_answer_ms"] = round((time.perf_counter() - llm_start) * 1000, 1)
+        evidence_sources = sources  # full evidence list for grounding, before the per-page dedupe
+        sources = dedupe_sources_by_page(sources)
         logger.info("graph.query.answer_generated", answer_preview=answer[:100], sources_count=len(sources))
 
         # Step 5 (Phase 4 Part 2): verify grounding of the synthesized answer.
         # Deterministic overlap always runs; the optional Bedrock entailment pass
         # only upgrades heuristic-ungrounded claims and degrades gracefully.
         grounding: Dict[str, Any] = {}
+        grounding_start = time.perf_counter()
         if verify_grounding and answer:
             try:
                 grounding = check_grounding(
                     answer=answer,
-                    evidence_items=sources,
+                    evidence_items=evidence_sources,
                     use_llm=True,
                     llm_caller=self._bedrock_grounding_caller,
                 )
@@ -687,6 +941,16 @@ class GraphQueryService:
                 logger.warning("graph.query.grounding_error", error=str(exc))
                 grounding = {}
 
+        timings["grounding_ms"] = round((time.perf_counter() - grounding_start) * 1000, 1)
+        # The deterministic total check is appended after grounding, so grounding only judges model output.
+        if itemised and total_check.get("missing_note"):
+            answer = f"{answer}\n\n{total_check['missing_note']}" if answer else total_check["missing_note"]
+        elif itemised and total_check.get("matched"):
+            answer = f"{answer}\n\nCheck: the category amounts sum to the stated total of {total_check['stated']}." if answer else ""
+        timings["total_ms"] = round((time.perf_counter() - total_start) * 1000, 1)
+        stage_only = {k: v for k, v in timings.items() if k not in ("total_ms", "retrieval_wall_ms")}
+        timings["slowest_stage"] = max(stage_only, key=stage_only.get) if stage_only else None
+
         return GraphQueryResult(
             question=question,
             answer=answer,
@@ -697,7 +961,46 @@ class GraphQueryService:
             mode="graph",
             seed_sources=seed_telemetry,
             grounding=grounding,
+            timings=timings,
+            itemised=itemised,
+            total_check=total_check,
         )
+
+    def _add_summary_nodes(
+        self,
+        graph: GraphMemory,
+        nodes: List[GraphNode],
+        pages: List[int],
+    ) -> List[GraphNode]:
+        """Adds graph nodes that have evidence on the summary pages, up to ITEMISED_MAX_NODES."""
+        if not pages:
+            return nodes
+        wanted = set(pages)
+        have = {n.id for n in nodes}
+        out = list(nodes)
+        for node in graph._nodes.values():
+            if len(out) >= ITEMISED_MAX_NODES:
+                break
+            if node.id in have:
+                continue
+            if any(int(ev.page_number) in wanted for ev in node.evidence or []):
+                out.append(node)
+                have.add(node.id)
+        return out
+
+    @staticmethod
+    def _append_summary_spans(
+        context_text: str,
+        sources: List[Dict[str, Any]],
+        pages: List[int],
+        spans: List[Tuple[int, str]],
+    ) -> Tuple[str, List[Dict[str, Any]]]:
+        """Adds every summary-page span to the LLM context and to the source list."""
+        lines = [f"\n=== SUMMARY PAGES {', '.join(str(p) for p in pages)}: ALL EVIDENCE SPANS ==="]
+        for page, text in spans:
+            lines.append(f'- [Page {page}]: "{text}"')
+        extra_sources = [{"page": page, "evidence": text} for page, text in spans]
+        return context_text + "\n" + "\n".join(lines), sources + extra_sources
 
     def _bedrock_grounding_caller(self, system: str, user: str) -> str:
         """Minimal Bedrock converse call for the optional grounding pass, reusing
@@ -754,14 +1057,16 @@ class GraphQueryService:
             return ""
 
     @staticmethod
-    def _sanitize_model_output(content: str) -> str:
-        """Strip <think> tags, conversational preamble, and leaked chain-of-thought scratchpad text."""
+    def _sanitize_model_output(content: str, keep_markdown: bool = False) -> str:
+        """Strip <think> tags, conversational preamble, and leaked chain-of-thought scratchpad text.
+        keep_markdown=True leaves bold, list, table and heading markers for the Markdown renderer."""
         content = re.sub(r"<think>.*?</think>", "", content, flags=re.DOTALL).strip()
         # Strip leading broken fragments or hanging quotes e.g. 'found". ' or '". '
         content = re.sub(r'^[^\w\s]*(?:found|stated|mentioned)?["\'”’\.]+\s*', '', content, flags=re.IGNORECASE).strip()
-        # Strip asterisks / markdown bolding
-        content = re.sub(r"\*{1,3}([^*]+)\*{1,3}", r"\1", content)
-        content = re.sub(r"[*_#`]+", "", content)
+        if not keep_markdown:
+            # Strip asterisks / markdown bolding
+            content = re.sub(r"\*{1,3}([^*]+)\*{1,3}", r"\1", content)
+            content = re.sub(r"[*_#`]+", "", content)
         content = re.sub(r"^(?:Assistant|Answer):\s*", "", content.strip(), flags=re.IGNORECASE)
 
         # Check for conversational reasoning preamble
@@ -906,14 +1211,40 @@ class GraphQueryService:
         lbl_clean = best_node.label.replace("_", " ")
         return f"The {lbl_clean} is {best_node.value}. (Source: Page {page})"
 
+    @staticmethod
+    def _bedrock_text(b_client: Any, kwargs: Dict[str, Any], on_token: Optional[Callable[[str], None]] = None) -> str:
+        """One Bedrock call that returns the answer text. Without on_token it uses converse. With on_token it
+        uses converse_stream and passes each text delta to on_token as it arrives. Reasoning deltas carry no
+        text and are not forwarded."""
+        if on_token is None:
+            b_resp = b_client.converse(**kwargs)
+            content = b_resp.get("output", {}).get("message", {}).get("content", [])
+            return next((block["text"] for block in content if isinstance(block, dict) and "text" in block), "")
+        parts: List[str] = []
+        for event in b_client.converse_stream(**kwargs).get("stream", []):
+            if not isinstance(event, dict):
+                continue
+            delta = (event.get("contentBlockDelta") or {}).get("delta") or {}
+            piece = delta.get("text") if isinstance(delta, dict) else None
+            if piece:
+                parts.append(piece)
+                try:
+                    on_token(piece)
+                except Exception as exc:
+                    logger.warning("graph.query.on_token_error", error=str(exc))
+        return "".join(parts)
+
     def _generate_answer(
         self,
         context_text: str,
         sources: List[Dict[str, Any]],
         nodes: List[GraphNode],
         question: str,
+        itemised: bool = False,
+        on_token: Optional[Callable[[str], None]] = None,
     ) -> str:
-        """Call LLM API with proper system/user role separation, with fallback."""
+        """Call LLM API with proper system/user role separation, with fallback.
+        With on_token set, Bedrock answers stream: each text delta goes to on_token as it arrives."""
         import os
         import httpx
         try:
@@ -964,9 +1295,21 @@ class GraphQueryService:
             or "arn:aws:bedrock:ap-south-1:106611079163:application-inference-profile/qdtz23c8eis1"
         )
 
+        if itemised:
+            style_rule = (
+                "Answer as Markdown: a bulleted list or table with each category name and its amount, "
+                "then the total. Use only the category rows in the evidence. If the evidence does not list every "
+                "category, or the listed amounts do not add up to the stated total, say so explicitly. "
+            )
+        else:
+            style_rule = (
+                "Answer the user's question directly, accurately, and concisely in 1 or 2 short sentences, "
+                "using Markdown only where it helps (bold for amounts, a list for several items). "
+            )
         system_prompt = (
             "You are a factual, concise Document QA assistant. "
-            "Answer the user's question directly, accurately, and concisely in 1 or 2 plain sentences based strictly on the provided Document Knowledge Graph evidence. "
+            + style_rule
+            + "Base the answer strictly on the provided Document Knowledge Graph evidence. "
             "Always cite the exact source page number where the answer is found (e.g. 'Source: Page 4').\n\n"
             "CRITICAL GUIDELINES:\n"
             "1. Grounding: Answer strictly based on the provided entities, properties, values, and relationships. Never guess or hallucinate.\n"
@@ -996,15 +1339,13 @@ class GraphQueryService:
                     kwargs["additionalModelRequestFields"] = {"reasoning_effort": effort}
 
                 try:
-                    b_resp = b_client.converse(**kwargs)
+                    text = self._bedrock_text(b_client, kwargs, on_token)
                 except Exception:
                     kwargs.pop("additionalModelRequestFields", None)
-                    b_resp = b_client.converse(**kwargs)
+                    text = self._bedrock_text(b_client, kwargs, on_token)
 
-                content = b_resp.get("output", {}).get("message", {}).get("content", [])
-                text = next((block["text"] for block in content if isinstance(block, dict) and "text" in block), "")
                 if text:
-                    cleaned = self._sanitize_model_output(text)
+                    cleaned = self._sanitize_model_output(text, keep_markdown=True)
                     if cleaned and len(cleaned) > 5:
                         return cleaned
 
@@ -1031,7 +1372,7 @@ class GraphQueryService:
                         msg = choices[0].get("message", {})
                         content = str(msg.get("content") or "").strip()
                         if content:
-                            cleaned = self._sanitize_model_output(content)
+                            cleaned = self._sanitize_model_output(content, keep_markdown=True)
                             is_conversational = bool(
                                 re.search(
                                     r"(?:the user wants to know|i can mention|i should|i will|i think|if there are multiple|might be incomplete|found[\"\'”’\.]|looking at|from the relevant|to answer this question|let\'s)",

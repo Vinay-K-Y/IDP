@@ -5,9 +5,8 @@ The tracker is the only writer of a job's progress. Every mutation runs under
 one lock and then replaces job["progress"] with a new dict. Readers therefore
 see either the old snapshot or the new one, never a partly written one.
 
-Timing uses a monotonic clock. Paused time is excluded from elapsed time and
-from the OCR and graph timers, so pauses do not distort the per-page rate used
-for the ETA.
+Timing uses a monotonic clock. Elapsed time, the OCR and graph timers and the
+per-page rate used for the ETA all run on that clock.
 
 Two timers are kept apart:
 - OCR time runs from begin_ocr() to finish_ocr(), which is called as soon as
@@ -30,18 +29,24 @@ from __future__ import annotations
 import math
 import threading
 import time
+from collections import deque
 from datetime import datetime
-from typing import Any, Callable, Dict, List, Optional, Sequence
+from typing import Any, Callable, Deque, Dict, List, Optional, Sequence
 
 PHASES = ("queued", "rendering", "ocr", "saving", "graph_building", "extracting", "finished", "killed")
+
+# Stage events reported by the page pipeline, in the order a page passes through them.
+# The probe stages are per document (page is None). The others carry a page number.
+STAGES = ("probe_start", "probe_done", "inspect_done", "route_done", "ocr_start", "ocr_done")
 
 # Phases in which the page-count ETA is meaningful.
 ETA_PHASES = ("rendering", "ocr", "extracting")
 
-# The ETA is shown only after this many pages and this much OCR time. Before
-# that, a rate estimate is too noisy to show.
-ETA_MIN_PAGES_DONE = 2
-ETA_MIN_OCR_SECONDS = 3.0
+# The ETA appears after the first page completes. Its rate is the average over the
+# last RATE_WINDOW_PAGES completions, measured in OCR seconds.
+ETA_MIN_PAGES_DONE = 1
+RATE_WINDOW_PAGES = 10
+RECENT_EVENTS = 12
 
 Clock = Callable[[], float]
 NowIso = Callable[[], str]
@@ -60,21 +65,26 @@ class JobProgressTracker:
         self._doc_pages: List[int] = []  # planned page count per document
         self._doc_index = -1
         self._tick: Optional[float] = None  # clock value at last fold; None when stopped
-        self._active_s = 0.0  # running time, pauses excluded
-        self._ocr_s = 0.0  # OCR time across all documents, pauses excluded
-        self._graph_s = 0.0  # graph-build time across all documents, pauses excluded
+        self._active_s = 0.0  # running time
+        self._ocr_s = 0.0  # OCR time across all documents
+        self._graph_s = 0.0  # graph-build time across all documents
         self._doc_ocr_s = 0.0  # OCR time of the current document
         self._doc_graph_s = 0.0  # graph-build time of the current document
         self._ocr_active = False  # OCR timer is running
         self._graph_active = False  # graph timer is running
-        self._paused_total_s = 0.0
-        self._pause_requested = False  # pause asked for; the worker may still be busy
-        self._idle = False  # worker is parked between documents because of the pause
         self._kill_requested = False  # kill asked for; the current document may still be running
+        self._seq = 0  # bumped on every state change; the poller uses it to spot new events
+        self._in_flight = 0  # pages whose OCR started and has not finished yet
+        self._rate_points: Deque[float] = deque([0.0], maxlen=RATE_WINDOW_PAGES + 1)  # OCR seconds at each completion
+        self._recent: Deque[Dict[str, Any]] = deque(maxlen=RECENT_EVENTS)
         self._state: Dict[str, Any] = {
             "phase": "queued",
             "pages_total": 0,
             "pages_done": 0,
+            "pages_in_flight": 0,
+            "stage": None,
+            "events_seq": 0,
+            "recent_events": [],
             "pages_skipped": 0,
             "current_doc": None,
             "current_doc_pages_total": 0,
@@ -83,8 +93,6 @@ class JobProgressTracker:
             "docs_done": 0,
             "started_at": None,
             "updated_at": None,
-            "paused_since": None,
-            "paused_total_s": 0.0,
             "ocr_s": 0.0,
             "ocr_started_at": None,
             "ocr_finished_at": None,
@@ -114,6 +122,8 @@ class JobProgressTracker:
             self._state["pages_total"] = sum(self._doc_pages)
             self._state["started_at"] = self._now_iso()
             self._tick = now
+            self._rate_points.clear()
+            self._rate_points.append(0.0)
             self._touch_locked()
             self._publish_locked()
 
@@ -152,14 +162,40 @@ class JobProgressTracker:
             self._touch_locked()
             self._publish_locked()
 
+    def record_stage(self, page_number: Optional[int], stage: str) -> None:
+        """Record a pipeline stage for one page (or for the document when page_number is None).
+
+        'ocr_start' adds to pages_in_flight. 'ocr_done' is recorded by page_done.
+        Safe to call from several worker threads.
+        """
+        if stage not in STAGES:
+            raise ValueError(f"invalid stage: {stage}")
+        with self._lock:
+            self._fold_locked(self._clock())
+            if stage == "ocr_start":
+                self._in_flight += 1
+            self._state["stage"] = stage
+            self._record_locked(stage, page_number)
+            self._touch_locked()
+            self._publish_locked()
+
     def page_done(self, page_number: Optional[int] = None) -> None:
-        """Count one finished page. Safe to call from several worker threads."""
+        """Count one finished page. Safe to call from several worker threads.
+
+        pages_done only moves forward, and it never passes pages_total. The rate
+        window stores the OCR time at each completion, so the ETA reflects the
+        order in which pages actually finish, not the page order.
+        """
         with self._lock:
             self._fold_locked(self._clock())
             s = self._state
             if s["current_doc_pages_done"] < s["current_doc_pages_total"]:
                 s["current_doc_pages_done"] += 1
                 s["pages_done"] += 1
+                self._rate_points.append(self._ocr_s)
+            self._in_flight = max(0, self._in_flight - 1)
+            self._state["stage"] = "ocr_done"
+            self._record_locked("ocr_done", page_number)
             self._touch_locked()
             self._publish_locked()
 
@@ -231,6 +267,8 @@ class JobProgressTracker:
                 s["pages_skipped"] += remaining
                 s["current_doc_pages_total"] -= remaining
             s["docs_done"] += 1
+            # A page whose OCR raised never calls page_done. The document is over, so none of its pages are in flight.
+            self._in_flight = 0
             # The document is over, whether OCR succeeded or failed. Leave the
             # per-document phase so the status does not still say 'OCR running'
             # while the next document is being prepared.
@@ -253,47 +291,12 @@ class JobProgressTracker:
                     self._state["pages_total"] -= unstarted
                     self._state["pages_skipped"] += unstarted
             self._state["phase"] = phase
-            self._pause_requested = False
-            self._idle = False
-            self._state["paused_since"] = None
+            self._in_flight = 0
             self._tick = None
             self._touch_locked()
             self._publish_locked()
 
-    # ----------------------------------------------------- pause / resume / kill
-
-    def pause(self) -> None:
-        """Pause was requested. The worker only pauses between documents.
-
-        Until the worker parks (mark_waiting), the job is 'pausing': the current
-        document keeps running and the clock keeps ticking.
-        """
-        with self._lock:
-            self._pause_requested = True
-            self._touch_locked()
-            self._publish_locked()
-
-    def mark_waiting(self) -> None:
-        """Called by the worker when it parks between documents because of a pause."""
-        with self._lock:
-            if not self._pause_requested or self._idle:
-                return
-            self._fold_locked(self._clock())
-            self._idle = True
-            self._state["paused_since"] = self._now_iso()
-            self._touch_locked()
-            self._publish_locked()
-
-    def resume(self) -> None:
-        with self._lock:
-            if not self._pause_requested:
-                return
-            self._fold_locked(self._clock())
-            self._pause_requested = False
-            self._idle = False
-            self._state["paused_since"] = None
-            self._touch_locked()
-            self._publish_locked()
+    # ------------------------------------------------------------------- kill
 
     def kill_requested(self) -> None:
         """Kill was requested. The current document keeps running until it ends.
@@ -303,9 +306,6 @@ class JobProgressTracker:
         with self._lock:
             self._fold_locked(self._clock())
             self._kill_requested = True
-            self._pause_requested = False
-            self._idle = False
-            self._state["paused_since"] = None
             self._state["phase"] = "killed"
             self._touch_locked()
             self._publish_locked()
@@ -323,38 +323,37 @@ class JobProgressTracker:
             s = dict(self._state)
             running_clock = self._tick is not None
             partial = max(0.0, t - self._tick) if running_clock else 0.0
-            clock_live = running_clock and not self._idle
 
-            active = self._active_s + (partial if clock_live else 0.0)
-            ocr = self._ocr_s + (partial if clock_live and self._ocr_active else 0.0)
-            graph = self._graph_s + (partial if clock_live and self._graph_active else 0.0)
-            paused_total = self._paused_total_s + (partial if running_clock and self._idle else 0.0)
+            active = self._active_s + (partial if running_clock else 0.0)
+            ocr = self._ocr_s + (partial if running_clock and self._ocr_active else 0.0)
+            graph = self._graph_s + (partial if running_clock and self._graph_active else 0.0)
 
             pages_total = s["pages_total"]
             pages_done = s["pages_done"]
             eta: Optional[float] = None
             if (
-                clock_live
+                running_clock
                 and s["started_at"] is not None
                 and s["phase"] in ETA_PHASES
                 and pages_total > 0
             ):
                 if pages_done >= pages_total:
                     eta = 0.0
-                elif pages_done >= ETA_MIN_PAGES_DONE and ocr >= ETA_MIN_OCR_SECONDS:
-                    per_page = ocr / pages_done
-                    eta = (pages_total - pages_done) * per_page
-                    if not math.isfinite(eta) or eta < 0:
-                        eta = None
+                elif pages_done >= ETA_MIN_PAGES_DONE:
+                    rate = self._rate_locked()
+                    if rate is not None:
+                        eta = (pages_total - pages_done) / rate
+                        if not math.isfinite(eta) or eta < 0:
+                            eta = None
 
             # Stopping: kill was requested, but the worker has not exited yet.
             s["stopping"] = bool(self._kill_requested and running_clock)
+            s["pages_completed"] = pages_done
             s["elapsed_s"] = round(active, 1) if s["started_at"] is not None else None
             s["eta_s"] = round(eta) if eta is not None else None
             s["ocr_s"] = round(ocr, 1)
             s["ocr_elapsed_s"] = round(ocr, 1)
             s["graph_elapsed_s"] = round(graph, 1)
-            s["paused_total_s"] = round(paused_total, 1)
             s["server_now"] = self._now_iso()
             return s
 
@@ -366,9 +365,6 @@ class JobProgressTracker:
             return
         dt = max(0.0, now - self._tick)
         self._tick = now
-        if self._idle:
-            self._paused_total_s += dt
-            return
         self._active_s += dt
         if self._ocr_active:
             self._ocr_s += dt
@@ -388,7 +384,24 @@ class JobProgressTracker:
             self._state["graph_finished_at"] = self._now_iso()
 
     def _touch_locked(self) -> None:
+        self._seq += 1
         self._state["updated_at"] = self._now_iso()
+        self._state["events_seq"] = self._seq
+        self._state["pages_in_flight"] = self._in_flight
+        self._state["recent_events"] = list(self._recent)
+
+    def _record_locked(self, stage: str, page_number: Optional[int]) -> None:
+        self._recent.append({"seq": self._seq + 1, "stage": stage, "page": page_number})
+
+    def _rate_locked(self) -> Optional[float]:
+        """Pages per OCR second over the recent completions, or None until the window has a span."""
+        points = list(self._rate_points)
+        if len(points) < 2:
+            return None
+        span = points[-1] - points[0]
+        if span <= 0:
+            return None
+        return (len(points) - 1) / span
 
     def _publish_locked(self) -> None:
         """Write a new progress dict onto the job. Never mutate the old dict in place."""
@@ -398,7 +411,6 @@ class JobProgressTracker:
         snapshot["ocr_s"] = round(self._ocr_s, 1)
         snapshot["ocr_elapsed_s"] = round(self._ocr_s, 1)
         snapshot["graph_elapsed_s"] = round(self._graph_s, 1)
-        snapshot["paused_total_s"] = round(self._paused_total_s, 1)
         self._job["progress"] = snapshot
 
 
@@ -418,11 +430,13 @@ def compact_progress(view: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]
         "pages_done": view["pages_done"],
         "pages_total": view["pages_total"],
         "pages_skipped": view["pages_skipped"],
+        "pages_in_flight": view["pages_in_flight"],
+        "events_seq": view["events_seq"],
+        "stage": view["stage"],
         "docs_done": view["docs_done"],
         "docs_total": view["docs_total"],
         "elapsed_s": view["elapsed_s"],
         "eta_s": view["eta_s"],
-        "paused_since": view["paused_since"],
         "stopping": view["stopping"],
         "ocr_elapsed_s": view["ocr_elapsed_s"],
         "graph_elapsed_s": view["graph_elapsed_s"],

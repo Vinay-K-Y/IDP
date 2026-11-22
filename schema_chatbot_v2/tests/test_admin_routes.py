@@ -63,8 +63,6 @@ def test_regular_user_forbidden_on_admin_routes(client):
     # 4. Admin pipeline endpoints
     assert client.get("/pipeline/status", headers=headers).status_code == 403
     assert client.get("/pipeline/jobs/job_1", headers=headers).status_code == 403
-    assert client.post("/pipeline/jobs/job_1/pause", headers=headers).status_code == 403
-    assert client.post("/pipeline/jobs/job_1/resume", headers=headers).status_code == 403
     assert client.post("/pipeline/jobs/job_1/kill", headers=headers).status_code == 403
     assert client.post("/pipeline/run", headers=headers).status_code == 403
 
@@ -84,16 +82,6 @@ def test_admin_can_control_any_job(client):
         "successes": [],
         "failures": [],
     }
-
-    # Admin pauses the job
-    pause_resp = client.post(f"/pipeline/jobs/{job_id}/pause", headers=headers)
-    assert pause_resp.status_code == 200
-    assert pause_resp.json()["status"] == "paused"
-
-    # Admin resumes the job
-    resume_resp = client.post(f"/pipeline/jobs/{job_id}/resume", headers=headers)
-    assert resume_resp.status_code == 200
-    assert resume_resp.json()["status"] == "running"
 
     # Admin kills the job
     kill_resp = client.post(f"/pipeline/jobs/{job_id}/kill", headers=headers)

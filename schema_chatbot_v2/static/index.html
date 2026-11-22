@@ -7,7 +7,7 @@
     <meta http-equiv="Pragma" content="no-cache">
     <meta http-equiv="Expires" content="0">
     <title>IDP — Extraction Pipeline Console</title>
-    <link rel="stylesheet" href="style.css?v=35">
+    <link rel="stylesheet" href="style.css?v=36">
 </head>
 <body>
     <!-- =========================== LOGIN OVERLAY =========================== -->
@@ -54,6 +54,7 @@
                     <div class="nav-group-label l">Admin</div>
                     <button class="tab-btn admin-only" data-tab="logs" id="tabBtnLogs">Logs</button>
                     <button class="tab-btn admin-only" data-tab="users" id="tabBtnUsers">User Management</button>
+                    <button class="tab-btn admin-only" data-tab="graph-builds" id="tabBtnGraphBuilds">Graph Builds</button>
                 </div>
             </nav>
 
@@ -233,8 +234,6 @@
                             <h2>Job Detail: <span id="detailJobId">—</span></h2>
                             <div class="card-actions">
                                 <span id="detailStatus" class="badge">—</span>
-                                <button class="btn btn-sm btn-warn hidden" id="jobPauseBtn" title="Pause active job">Pause</button>
-                                <button class="btn btn-sm btn-primary hidden" id="jobResumeBtn" title="Resume paused job">Resume</button>
                                 <button class="btn btn-sm btn-danger hidden" id="jobKillBtn" title="Kill / cancel job">Kill</button>
                             </div>
                         </div>
@@ -281,8 +280,6 @@
                             <h2>Job Detail: <span id="userDetailJobId">—</span></h2>
                             <div class="card-actions">
                                 <span id="userDetailStatus" class="badge">—</span>
-                                <button class="btn btn-sm btn-warn hidden" id="userJobPauseBtn" title="Pause active job">Pause</button>
-                                <button class="btn btn-sm btn-primary hidden" id="userJobResumeBtn" title="Resume paused job">Resume</button>
                                 <button class="btn btn-sm btn-danger hidden" id="userJobKillBtn" title="Kill / cancel job">Kill</button>
                             </div>
                         </div>
@@ -303,14 +300,16 @@
 
                 <div class="card">
                     <h2>Upload Shared Documents</h2>
-                    <div class="upload-zone" id="uploadZone">
-                        <input type="file" id="fileInput" multiple accept="application/pdf,.pdf" hidden>
-                        <div class="upload-inner">
-                            <p class="upload-icon"></p>
-                            <p><strong>Drag &amp; drop PDFs here</strong> or <a href="#" id="browseBtn">browse</a></p>
-                        </div>
+                    <div class="upload-zone" id="uploadZone" data-max-mb="20">
+                        <input type="file" id="fileInput" class="upload-input" multiple accept="application/pdf,.pdf">
+                        <label class="upload-label" for="fileInput">
+                            <svg class="upload-svg" viewBox="0 0 24 24" aria-hidden="true" focusable="false"><path d="M12 15V4m0 0-4 4m4-4 4 4M4 15v3a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2v-3" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg>
+                            <span class="upload-text">Drag &amp; drop PDFs here or <span class="upload-browse">browse</span></span>
+                            <span class="upload-hint">PDF only &middot; max 20 MB</span>
+                        </label>
+                        <div class="upload-progress hidden" id="uploadProgress" aria-hidden="true"><div class="upload-progress-bar" id="uploadProgressBar"></div></div>
                     </div>
-                    <div id="uploadStatus" class="status-box hidden"></div>
+                    <div id="uploadStatus" class="status-box hidden" role="alert" aria-live="assertive"></div>
                 </div>
 
                 <div class="card">
@@ -383,14 +382,16 @@
 
                 <div class="card">
                     <h2>Upload My Documents</h2>
-                    <div class="upload-zone" id="userUploadZone">
-                        <input type="file" id="userFileInput" multiple accept="application/pdf,.pdf" hidden>
-                        <div class="upload-inner">
-                            <p class="upload-icon"></p>
-                            <p><strong>Drag &amp; drop PDFs here</strong> or <a href="#" id="userBrowseBtn">browse</a></p>
-                        </div>
+                    <div class="upload-zone" id="userUploadZone" data-max-mb="20">
+                        <input type="file" id="userFileInput" class="upload-input" multiple accept="application/pdf,.pdf">
+                        <label class="upload-label" for="userFileInput">
+                            <svg class="upload-svg" viewBox="0 0 24 24" aria-hidden="true" focusable="false"><path d="M12 15V4m0 0-4 4m4-4 4 4M4 15v3a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2v-3" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg>
+                            <span class="upload-text">Drag &amp; drop PDFs here or <span class="upload-browse">browse</span></span>
+                            <span class="upload-hint">PDF only &middot; max 20 MB</span>
+                        </label>
+                        <div class="upload-progress hidden" id="userUploadProgress" aria-hidden="true"><div class="upload-progress-bar" id="userUploadProgressBar"></div></div>
                     </div>
-                    <div id="userUploadStatus" class="status-box hidden"></div>
+                    <div id="userUploadStatus" class="status-box hidden" role="alert" aria-live="assertive"></div>
                 </div>
 
                 <div class="card">
@@ -457,7 +458,7 @@
                     </div>
                 </div>
 
-                <div class="card">
+                <div class="card logs-card">
                     <div class="card-header">
                         <h2>System &amp; User Activity Logs</h2>
                         <div class="card-actions">
@@ -468,11 +469,16 @@
                     </div>
 
                     <!-- User Activity Sub-Panel -->
-                    <div id="userLogsPanel">
-                        <div class="log-filter-row">
+                    <div id="userLogsPanel" class="logs-sub-panel">
+                        <div class="logs-toolbar">
                             <input type="text" id="logFilterUsername" placeholder="Filter by username (e.g. admin)...">
                             <button class="btn btn-primary btn-sm" id="applyLogFilterBtn">Filter</button>
                             <button class="btn btn-ghost btn-sm" id="clearLogFilterBtn">Clear</button>
+                        </div>
+                        <div class="logs-toolbar">
+                            <input type="search" id="userLogSearch" placeholder="Search this page of logs..." aria-label="Search user activity logs">
+                            <label class="logs-toggle"><input type="checkbox" id="userLogAutoRefresh"> Auto-refresh 5 s</label>
+                            <span class="logs-status" id="userLogStatus" aria-live="polite"></span>
                         </div>
                         <div id="userLogsList" class="logs-container">
                             <p class="muted">Loading user logs...</p>
@@ -480,8 +486,22 @@
                     </div>
 
                     <!-- System Logs Sub-Panel -->
-                    <div id="systemLogsPanel" class="hidden">
-                        <div id="systemLogsList" class="logs-container log-terminal">
+                    <div id="systemLogsPanel" class="logs-sub-panel hidden">
+                        <div class="logs-toolbar">
+                            <input type="search" id="systemLogSearch" placeholder="Search log text..." aria-label="Search system logs">
+                            <select id="systemLogLevel" aria-label="Filter by level">
+                                <option value="">All levels</option>
+                                <option value="INFO">INFO</option>
+                                <option value="WARN">WARN</option>
+                                <option value="ERROR">ERROR</option>
+                            </select>
+                            <label class="logs-toggle"><input type="checkbox" id="systemLogTail" checked> Tail</label>
+                            <label class="logs-toggle"><input type="checkbox" id="systemLogAutoRefresh" checked> Auto-refresh 5 s</label>
+                            <button class="btn btn-outline btn-sm" id="copyLogsBtn" type="button">Copy</button>
+                            <button class="btn btn-outline btn-sm" id="downloadLogsBtn" type="button">Download</button>
+                            <span class="logs-status" id="systemLogStatus" aria-live="polite"></span>
+                        </div>
+                        <div id="systemLogsList" class="logs-container log-terminal" tabindex="0" aria-label="System log output">
                             <p class="muted">Loading system logs...</p>
                         </div>
                     </div>
@@ -533,6 +553,27 @@
                 </div>
             </section>
 
+            <!-- =========================== TAB: Graph Builds (Admin Only) =========================== -->
+            <section id="tab-graph-builds" class="tab-panel admin-only">
+                <div class="page-head">
+                    <div>
+                        <h1>Graph Builds</h1>
+                        <p class="s">Choose which saved graph build the Query Bot uses for each document. Empty builds cannot be chosen.</p>
+                    </div>
+                </div>
+
+                <div class="card">
+                    <div class="card-header">
+                        <h2>Saved Builds</h2>
+                        <button class="btn btn-ghost btn-sm" id="graphBuildsRefresh">Refresh</button>
+                    </div>
+                    <div id="graphBuildsStatus" class="status-box hidden"></div>
+                    <div id="graphBuildsList">
+                        <p class="muted">Loading graph builds...</p>
+                    </div>
+                </div>
+            </section>
+
             <!-- =========================== TAB: Query Bot =========================== -->
             <section id="tab-querybot" class="tab-panel">
                 <div class="page-head">
@@ -557,6 +598,7 @@
                             <option value="">-- Select Active Document --</option>
                         </select>
                         <span id="tab_qb_mode_badge" class="badge" style="display: none;"></span>
+                        <div id="tab_qb_graph_build" class="qb-build-info" style="display: none;"></div>
                     </div>
 
                     <!-- Chat window -->
@@ -576,6 +618,7 @@
         </main>
     </div>
 
-    <script src="app.js?v=33"></script>
+    <script src="markdown-lite.js?v=1"></script>
+    <script src="app.js?v=36"></script>
 </body>
 </html>

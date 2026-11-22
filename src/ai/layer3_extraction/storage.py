@@ -19,7 +19,8 @@ from __future__ import annotations
 import hashlib
 import json
 from datetime import datetime, timezone
-from typing import List, Optional
+from pathlib import Path
+from typing import Dict, List, Optional, Tuple
 
 from sqlalchemy import (
     DateTime,
@@ -94,6 +95,19 @@ def get_engine():
 
 def get_session():
     return SessionLocal()
+
+
+def to_utc_iso(value: Optional[datetime]) -> Optional[str]:
+    """
+    ISO-8601 string in UTC with an explicit +00:00 offset.
+    Naive values are stored as UTC by the DateTime columns, so they are tagged as UTC.
+    Aware values keep their instant and are converted to UTC.
+    """
+    if value is None:
+        return None
+    if value.tzinfo is None:
+        value = value.replace(tzinfo=timezone.utc)
+    return value.astimezone(timezone.utc).isoformat()
 
 
 # ==============================================================================
@@ -215,6 +229,24 @@ class DocumentGraphRecord(Base):
 
 
 # ==============================================================================
+# Table 6b: Admin-chosen active graph build per document and owner
+# One row per (owner, doc_key). Ownerless choices store owner = "".
+# ==============================================================================
+class DocumentActiveGraphRecord(Base):
+    __tablename__ = "document_active_graphs"
+    __table_args__ = (
+        UniqueConstraint("owner", "doc_key", name="uq_document_active_graphs_owner_doc_key"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    doc_key: Mapped[str] = mapped_column(String, nullable=False, index=True)
+    owner: Mapped[str] = mapped_column(String, nullable=False)
+    job_id: Mapped[str] = mapped_column(String, nullable=False)
+    set_by: Mapped[str] = mapped_column(String, nullable=False)
+    set_at: Mapped[datetime] = mapped_column(DateTime, nullable=False, default=lambda: datetime.now(timezone.utc))
+
+
+# ==============================================================================
 # Table 7: Durable Page Delta Checkpoints (Layer 3)
 # ==============================================================================
 class PageCheckpointRecord(Base):
@@ -254,8 +286,37 @@ class UserRecord(Base):
     updated_at: Mapped[datetime] = mapped_column(DateTime, default=lambda: datetime.now(timezone.utc), onupdate=lambda: datetime.now(timezone.utc))
 
 
+# ==============================================================================
+# Table 9: Document Processing Status (one row per owner and doc_id)
+# Written by the pipeline runner and the kill endpoints.
+# A markdown or extraction row with no status row reads as completed.
+# ==============================================================================
+DOCUMENT_STATUSES = ("pending", "processing", "completed", "failed", "cancelled")
+
+# Rows written before pause was removed may still hold 'paused'. Reads map it to
+# 'cancelled' so the API and UI never see a status they do not know. No migration.
+LEGACY_STATUS_MAP = {"paused": "cancelled"}
+
+
+class DocumentProcessingStatus(Base):
+    __tablename__ = "document_processing_status"
+    __table_args__ = (
+        UniqueConstraint("owner", "doc_id", name="uq_document_processing_status_owner_doc_id"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    owner: Mapped[str] = mapped_column(String, nullable=False, index=True)
+    doc_id: Mapped[str] = mapped_column(String, nullable=False, index=True)
+    job_id: Mapped[Optional[str]] = mapped_column(String, nullable=True, index=True)
+    status: Mapped[str] = mapped_column(String, nullable=False)
+    error: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime, default=lambda: datetime.now(timezone.utc), onupdate=lambda: datetime.now(timezone.utc)
+    )
+
+
 def init_db():
-    """Create all 8 tables in PostgreSQL / SQLite if they do not exist."""
+    """Create all 9 tables in PostgreSQL / SQLite if they do not exist."""
     global engine, SessionLocal
     try:
         Base.metadata.create_all(engine)
@@ -528,7 +589,7 @@ def _ocr_doc_row_to_dict(r) -> dict:
         "owner": r.owner,
         "page_count": r.page_count,
         "size_chars": int(r.size_chars or 0),
-        "created_at": r.created_at.isoformat() if r.created_at else None,
+        "created_at": to_utc_iso(r.created_at),
         "schema_id": r.schema_id,
         "has_graph": bool(r.has_graph),
         "has_extraction": bool(r.has_extraction),
@@ -704,6 +765,8 @@ def save_document_graph(
         init_db()
         nodes = graph_dict.get("nodes", [])
         edges = graph_dict.get("edges", [])
+        if not nodes:
+            logger.warning("storage.graph_saved_empty", doc_id=doc_id, job_id=job_id, owner=owner)
         session = SessionLocal()
         try:
             query = session.query(DocumentGraphRecord).filter_by(doc_id=doc_id)
@@ -812,6 +875,68 @@ def list_document_graphs(owner: Optional[str] = None) -> list:
     except Exception as exc:
         logger.error("storage.list_document_graphs_failed", error=str(exc))
         return []
+
+
+# ==============================================================================
+# Active Graph Build Helpers (admin choice per document and owner)
+# ==============================================================================
+
+def doc_key_for(doc_id: str) -> str:
+    """Document key used by the query bot list and the active-build choice, e.g. 'bill.pdf'."""
+    return doc_id if doc_id.lower().endswith(".pdf") else f"{Path(doc_id).stem}.pdf"
+
+
+def owner_key(owner: Optional[str]) -> str:
+    """Owner value stored in the choice table. Ownerless graph rows map to ''."""
+    return owner or ""
+
+
+def get_active_choice(session, doc_key: str, owner: Optional[str]) -> Optional["DocumentActiveGraphRecord"]:
+    return session.query(DocumentActiveGraphRecord).filter_by(doc_key=doc_key, owner=owner_key(owner)).first()
+
+
+def set_active_choice(session, doc_key: str, owner: Optional[str], job_id: str, set_by: str) -> "DocumentActiveGraphRecord":
+    """Creates or updates the admin choice for (owner, doc_key). Caller validates job_id."""
+    rec = get_active_choice(session, doc_key, owner)
+    now = datetime.now(timezone.utc)
+    if rec is None:
+        rec = DocumentActiveGraphRecord(doc_key=doc_key, owner=owner_key(owner), job_id=job_id, set_by=set_by, set_at=now)
+        session.add(rec)
+    else:
+        rec.job_id = job_id
+        rec.set_by = set_by
+        rec.set_at = now
+    session.commit()
+    return rec
+
+
+def clear_active_choice(session, doc_key: str, owner: Optional[str]) -> int:
+    """Removes the admin choice only. Graph rows are never touched."""
+    deleted = session.query(DocumentActiveGraphRecord).filter_by(doc_key=doc_key, owner=owner_key(owner)).delete()
+    session.commit()
+    return deleted
+
+
+def select_active_graph_row(session, rows: List["DocumentGraphRecord"], doc_key: Optional[str] = None) -> Tuple[Optional["DocumentGraphRecord"], bool]:
+    """
+    Picks the graph build the query bot uses from rows of one document and owner scope.
+    Empty builds (node_count == 0) are never picked. Returns (row, only_empty):
+      row is the admin's choice when it points at a non-empty build of the same owner,
+      otherwise the newest non-empty build. only_empty is True when rows exist but none is non-empty.
+    Pass doc_key=None to skip the admin choice (job-id lookups).
+    """
+    ordered = sorted(rows, key=lambda r: (r.created_at or datetime.min, r.id or 0), reverse=True)
+    nonempty = [r for r in ordered if (r.node_count or 0) > 0]
+    if not nonempty:
+        return None, bool(ordered)
+    default = nonempty[0]
+    if doc_key:
+        choice = get_active_choice(session, doc_key, default.owner)
+        if choice is not None:
+            for r in nonempty:
+                if r.job_id == choice.job_id and owner_key(r.owner) == owner_key(default.owner):
+                    return r, False
+    return default, False
 
 
 # ==============================================================================
@@ -1277,7 +1402,7 @@ def list_markdown_records(owner: str) -> List[dict]:
                     "doc_id": r.doc_id,
                     "owner": r.owner,
                     "size": len(r.markdown_content or ""),
-                    "modified": r.created_at.isoformat() if r.created_at else None,
+                    "modified": to_utc_iso(r.created_at),
                     "page_count": r.page_count,
                     "schema_id": r.schema_id or ref.get("schema_id"),
                     "source_pdf": ref.get("source_pdf") or (
@@ -1324,3 +1449,199 @@ def list_markdown_records_for_owner(owner: str) -> List[dict]:
     Directly delegates to list_markdown_records(owner=owner) enforcing DB isolation.
     """
     return list_markdown_records(owner=owner)
+
+
+# ==============================================================================
+# Document processing status (Table 9)
+# ==============================================================================
+
+def set_document_status(
+    owner: str,
+    doc_id: str,
+    job_id: Optional[str],
+    status: str,
+    error: Optional[str] = None,
+) -> None:
+    """Insert or update the status of one document for one owner. Raises on bad input or DB errors."""
+    if status not in DOCUMENT_STATUSES:
+        raise ValueError(f"unknown document status: {status!r}")
+    if not owner or not doc_id:
+        raise ValueError("owner and doc_id are required")
+    init_db()
+    session = SessionLocal()
+    try:
+        rec = (
+            session.query(DocumentProcessingStatus)
+            .filter(DocumentProcessingStatus.owner == owner, DocumentProcessingStatus.doc_id == doc_id)
+            .first()
+        )
+        if rec is None:
+            rec = DocumentProcessingStatus(owner=owner, doc_id=doc_id)
+            session.add(rec)
+        rec.job_id = job_id
+        rec.status = status
+        rec.error = str(error)[:2000] if error else None
+        rec.updated_at = datetime.now(timezone.utc)
+        session.commit()
+    finally:
+        session.close()
+
+
+def _status_entry(owner: str, doc_id: str, status: str, job_id=None, error=None, updated_at=None) -> dict:
+    return {
+        "owner": owner,
+        "doc_id": doc_id,
+        "status": status,
+        "job_id": job_id,
+        "error": error,
+        "updated_at": to_utc_iso(updated_at),
+    }
+
+
+def get_document_statuses(owner_or_star: str, doc_ids: Optional[List[str]] = None) -> Dict[Tuple[str, str], dict]:
+    """
+    Status per (owner, doc_id). owner_or_star is one owner, or '*' / '_all' for every owner.
+    doc_ids limits the lookup to those ids. A markdown row or extraction run with no status
+    row reads as completed, so documents processed before this table existed show as completed.
+    """
+    if not owner_or_star or not isinstance(owner_or_star, str) or not owner_or_star.strip():
+        return {}
+    owner_or_star = owner_or_star.strip()
+    all_owners = owner_or_star in ("*", "_all")
+    if doc_ids is not None and not list(doc_ids):
+        return {}
+    ids = list(doc_ids) if doc_ids is not None else None
+
+    init_db()
+    session = SessionLocal()
+    try:
+        out: Dict[Tuple[str, str], dict] = {}
+
+        q = session.query(DocumentProcessingStatus)
+        if not all_owners:
+            q = q.filter(DocumentProcessingStatus.owner == owner_or_star)
+        if ids is not None:
+            q = q.filter(DocumentProcessingStatus.doc_id.in_(ids))
+        for r in q.all():
+            status = LEGACY_STATUS_MAP.get(r.status, r.status)
+            out[(r.owner, r.doc_id)] = _status_entry(
+                r.owner, r.doc_id, status, job_id=r.job_id, error=r.error, updated_at=r.updated_at
+            )
+
+        for model in (MarkdownRecord, ExtractionRun):
+            mq = session.query(model.owner, model.doc_id, model.created_at)
+            if not all_owners:
+                mq = mq.filter(model.owner == owner_or_star)
+            if ids is not None:
+                mq = mq.filter(model.doc_id.in_(ids))
+            for owner, doc_id, created_at in mq.all():
+                key = (owner, doc_id)
+                if key not in out:
+                    out[key] = _status_entry(owner, doc_id, "completed", updated_at=created_at)
+        return out
+    finally:
+        session.close()
+
+
+def latest_status_by_doc(statuses: Dict[Tuple[str, str], dict]) -> Dict[str, dict]:
+    """
+    Pick one status per doc_id when several owners share it: the most recently updated entry.
+    Used by the admin view, which lists shared documents without an owner.
+    """
+    best: Dict[str, dict] = {}
+    for entry in statuses.values():
+        current = best.get(entry["doc_id"])
+        if current is None or (entry.get("updated_at") or "") > (current.get("updated_at") or ""):
+            best[entry["doc_id"]] = entry
+    return best
+
+
+def list_output_summaries(owner_or_star: str) -> List[dict]:
+    """
+    Output records from list_markdown_records, each with job_id (from the status table, or None)
+    and has_extracted (True when an extraction run exists for the same owner and doc_id).
+    owner_or_star is one owner, or '*' for all owners.
+    """
+    records = list_markdown_records(owner=owner_or_star)
+    if not records:
+        return []
+    all_owners = owner_or_star in ("*", "_all")
+    init_db()
+    session = SessionLocal()
+    try:
+        jq = session.query(DocumentProcessingStatus.owner, DocumentProcessingStatus.doc_id, DocumentProcessingStatus.job_id)
+        eq = session.query(ExtractionRun.owner, ExtractionRun.doc_id).distinct()
+        if not all_owners:
+            jq = jq.filter(DocumentProcessingStatus.owner == owner_or_star)
+            eq = eq.filter(ExtractionRun.owner == owner_or_star)
+        job_by_key = {(o, d): j for o, d, j in jq.all()}
+        extracted = set(eq.all())
+    finally:
+        session.close()
+
+    for rec in records:
+        key = (rec["owner"], rec["doc_id"])
+        rec["job_id"] = job_by_key.get(key)
+        rec["has_extracted"] = key in extracted
+        rec["created_at"] = rec["modified"]
+    return records
+
+
+def backfill_document_status() -> int:
+    """
+    Insert a completed status row for each (owner, doc_id) that has a markdown row,
+    an extraction run or a graph, and no status row yet. Existing rows are never changed.
+    Returns the number of rows inserted. Running it again inserts nothing.
+    """
+    init_db()
+    session = SessionLocal()
+    try:
+        existing = set(session.query(DocumentProcessingStatus.owner, DocumentProcessingStatus.doc_id).all())
+        candidates: Dict[Tuple[str, str], Optional[str]] = {}
+        for owner, doc_id, job_id in session.query(
+            DocumentGraphRecord.owner, DocumentGraphRecord.doc_id, DocumentGraphRecord.job_id
+        ).all():
+            if owner and doc_id:
+                candidates.setdefault((owner, doc_id), job_id)
+        for model in (MarkdownRecord, ExtractionRun):
+            for owner, doc_id in session.query(model.owner, model.doc_id).distinct().all():
+                if owner and doc_id:
+                    candidates.setdefault((owner, doc_id), None)
+
+        now = datetime.now(timezone.utc)
+        inserted = 0
+        for (owner, doc_id), job_id in candidates.items():
+            if (owner, doc_id) in existing:
+                continue
+            session.add(DocumentProcessingStatus(
+                owner=owner, doc_id=doc_id, job_id=job_id, status="completed", error=None, updated_at=now,
+            ))
+            inserted += 1
+        session.commit()
+        return inserted
+    finally:
+        session.close()
+
+
+def _main(argv: Optional[List[str]] = None) -> int:
+    import argparse
+
+    parser = argparse.ArgumentParser(prog="python -m src.ai.layer3_extraction.storage")
+    commands = parser.add_subparsers(dest="command", required=True)
+    commands.add_parser(
+        "backfill-status",
+        help="Mark already-processed documents as completed. Idempotent.",
+    )
+    args = parser.parse_args(argv)
+
+    if args.command == "backfill-status":
+        init_db()
+        # Print the engine that will be written to. The password is hidden.
+        print(f"database: {engine.url.render_as_string(hide_password=True)}", flush=True)
+        inserted = backfill_document_status()
+        print(f"backfill-status: inserted {inserted} row(s)", flush=True)
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(_main())

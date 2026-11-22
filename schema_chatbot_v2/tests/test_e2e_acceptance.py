@@ -73,7 +73,7 @@ def test_acceptance_criteria_complete_suite(client, monkeypatch):
     # 3. User1 gets 403 on every admin-only endpoint
     for path in ["/documents", "/schemas", "/pipeline/status", "/pipeline/jobs/dummy_job_id", "/admin/logs/system", "/admin/logs/users", "/admin/users"]:
         assert client.get(path, headers=auth1).status_code == 403
-    for path in ["/documents/upload", "/pipeline/jobs/dummy/pause", "/pipeline/jobs/dummy/resume", "/pipeline/jobs/dummy/kill", "/pipeline/run", "/admin/users"]:
+    for path in ["/documents/upload", "/pipeline/jobs/dummy/kill", "/pipeline/run", "/admin/users"]:
         assert client.post(path, headers=auth1).status_code == 403
 
     # 4. User1 and User2 upload documents to /me/documents and are isolated
@@ -133,9 +133,7 @@ def test_acceptance_criteria_complete_suite(client, monkeypatch):
     assert any(j["job_id"] == job_u1_id for j in st1)
     assert not any(j["job_id"] == job_u1_id for j in st2)
 
-    # 7. Guessing job_id: User2 gets 404 (not 403) trying to pause/resume/kill User1's job
-    assert client.post(f"/me/pipeline/jobs/{job_u1_id}/pause", headers=auth2).status_code == 404
-    assert client.post(f"/me/pipeline/jobs/{job_u1_id}/resume", headers=auth2).status_code == 404
+    # 7. Guessing job_id: User2 gets 404 (not 403) trying to kill User1's job
     assert client.post(f"/me/pipeline/jobs/{job_u1_id}/kill", headers=auth2).status_code == 404
 
     # 8. Admin can control any job regardless of owner
@@ -150,10 +148,6 @@ def test_acceptance_criteria_complete_suite(client, monkeypatch):
         "failures": [],
     }
 
-    assert client.post("/pipeline/jobs/job_running_u1/pause", headers=admin_auth).status_code == 200
-    assert _pipeline_jobs["job_running_u1"]["status"] == "paused"
-    assert client.post("/pipeline/jobs/job_running_u1/resume", headers=admin_auth).status_code == 200
-    assert _pipeline_jobs["job_running_u1"]["status"] == "running"
     assert client.post("/pipeline/jobs/job_running_u1/kill", headers=admin_auth).status_code == 200
     assert _pipeline_jobs["job_running_u1"]["status"] == "killed"
 

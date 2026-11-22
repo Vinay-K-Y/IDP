@@ -38,6 +38,10 @@
         return (bytes / 1024 / 1024).toFixed(2) + ' MB';
     }
 
+    // Inline SVG file icons. No icon font, so they render without a network request.
+    const PDF_ICON_SVG = '<svg viewBox="0 0 24 24" aria-hidden="true" focusable="false"><path d="M14 3H7a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2V8z" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linejoin="round"/><path d="M14 3v5h5M8.5 13h7M8.5 16.5h5" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/></svg>';
+    const FILE_ICON_SVG = '<svg viewBox="0 0 24 24" aria-hidden="true" focusable="false"><path d="M14 3H7a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2V8z" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linejoin="round"/><path d="M14 3v5h5" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linejoin="round"/></svg>';
+
     function escapeHtml(str) {
         if (str === null || str === undefined) return '';
         return String(str)
@@ -257,6 +261,8 @@
                 loadUserActivityLogs();
             } else if (btn.dataset.tab === 'users') {
                 loadUsersList();
+            } else if (btn.dataset.tab === 'graph-builds') {
+                loadGraphBuilds();
             } else if (btn.dataset.tab === 'querybot') {
                 loadAllExtractedData();
             }
@@ -303,15 +309,13 @@
                 const row = el('div', 'doc-item');
                 const info = el('div', 'doc-item-info');
                 info.innerHTML = `
-                    <span class="doc-icon"></span>
+                    <span class="doc-icon" aria-hidden="true">${PDF_ICON_SVG}</span>
                     <div>
                         <div class="doc-name">${escapeHtml(d.name)}</div>
-                        <div class="doc-meta">${fmtSize(d.size)} • ${new Date(d.modified).toLocaleString()}</div>
+                        <div class="doc-meta">${fmtSize(d.size)} • ${fmtDateTime(d.modified)}</div>
                     </div>
                 `;
-                const badge = d.has_output
-                    ? '<span class="badge doc-badge badge-success">processed</span>'
-                    : '<span class="badge doc-badge badge-mute">pending</span>';
+                const badge = renderDocStatusBadge(d.status);
                 const actions = el('div', 'doc-item-actions');
                 const delBtn = el('button', 'btn btn-danger btn-sm');
                 delBtn.type = 'button';
@@ -332,33 +336,61 @@
             outList.innerHTML = '<p class="muted">No processed outputs yet. Run the pipeline.</p>';
         } else {
             outList.innerHTML = '';
-            outs.forEach(o => {
-                const row = el('div', 'doc-item');
-                const info = el('div', 'doc-item-info');
-                const schema = o.schema_ref ? ` • schema: <code>${escapeHtml(o.schema_ref.schema_id || '--')}</code>` : '';
-                info.innerHTML = `
-                    <span class="doc-icon"></span>
-                    <div>
-                        <div class="doc-name">${escapeHtml(o.name)}</div>
-                        <div class="doc-meta">${fmtSize(o.size)} • ${new Date(o.modified).toLocaleString()}${schema}</div>
-                    </div>
-                `;
-                const actions = el('div', 'doc-item-actions');
-                const dl = el('button', 'btn btn-outline btn-sm');
-                dl.type = 'button';
-                dl.textContent = 'Download';
-                dl.addEventListener('click', () => downloadOutput('/documents/output/', o.name));
-                actions.appendChild(dl);
-                row.appendChild(info);
-                row.appendChild(actions);
-                outList.appendChild(row);
-            });
+            outs.forEach(o => outList.appendChild(buildOutputRow('admin', o)));
         }
     }
 
-    async function downloadOutput(basePath, name) {
+    // One row of the Outputs card. The admin and user cards share it. scope picks the OCR routes.
+    function buildOutputRow(scope, o) {
+        const row = el('div', 'doc-item');
+        const info = el('div', 'doc-item-info');
+        const schema = o.schema_ref ? ` • schema: <code>${escapeHtml(o.schema_ref.schema_id || '--')}</code>` : '';
+        const job = o.job_id ? `<code>${escapeHtml(o.job_id)}</code>` : '--';
+        info.innerHTML = `
+            <span class="doc-icon doc-icon-file" aria-hidden="true">${FILE_ICON_SVG}</span>
+            <div>
+                <div class="doc-name">${escapeHtml(o.name)}</div>
+                <div class="doc-meta">${fmtSize(o.size)} • ${fmtDateTime(o.created_at || o.modified)} • job ${job}${schema}</div>
+            </div>
+        `;
+        const doc = {
+            doc_id: o.doc_id || o.name,
+            owner: o.owner,
+            md_filename: o.name,
+            created_at: o.created_at || o.modified,
+        };
+        const actions = el('div', 'doc-item-actions');
+        const view = el('button', 'btn btn-ghost btn-sm');
+        view.type = 'button';
+        view.textContent = 'View';
+        view.setAttribute('aria-label', `View ${o.name}`);
+        view.addEventListener('click', () => viewOcrDocument(scope, doc));
+        const md = el('button', 'btn btn-outline btn-sm');
+        md.type = 'button';
+        md.textContent = 'Download .md';
+        md.setAttribute('aria-label', `Download ${o.name}`);
+        md.addEventListener('click', () => downloadOcrDocument(scope, doc));
+        actions.append(view, md);
+        if (o.has_extracted) {
+            const js = el('button', 'btn btn-outline btn-sm');
+            js.type = 'button';
+            js.textContent = 'Download JSON';
+            js.setAttribute('aria-label', `Download JSON for ${o.name}`);
+            if (scope === 'admin') {
+                js.addEventListener('click', () => downloadOutput('/documents/output/', o.name, o.owner));
+            } else {
+                js.addEventListener('click', () => downloadOutput('/me/outputs/output/', o.name));
+            }
+            actions.appendChild(js);
+        }
+        row.append(info, actions);
+        return row;
+    }
+
+    async function downloadOutput(basePath, name, owner) {
         try {
-            const data = await api(basePath + encodeURIComponent(name));
+            const query = owner ? `?owner=${encodeURIComponent(owner)}` : '';
+            const data = await api(basePath + encodeURIComponent(name) + query);
             const blob = new Blob([JSON.stringify(data, null, 2)], { type: 'application/json' });
             const url = URL.createObjectURL(blob);
             const a = document.createElement('a');
@@ -401,10 +433,29 @@
         return url;
     }
 
-    function fmtSavedAt(iso) {
-        if (!iso) return '--';
-        const d = new Date(iso);
-        return Number.isNaN(d.getTime()) ? '--' : d.toLocaleString();
+    // API timestamps are UTC. A value with no offset is read as UTC, then shown in the browser's time zone.
+    const dateTimeFormat = new Intl.DateTimeFormat(undefined, { dateStyle: 'medium', timeStyle: 'short' });
+    function fmtDateTime(value) {
+        if (!value) return '--';
+        let text = String(value).trim();
+        if (/T\d{2}:\d{2}(:\d{2}(\.\d+)?)?$/.test(text)) text += 'Z';
+        const d = new Date(text);
+        return Number.isNaN(d.getTime()) ? '--' : dateTimeFormat.format(d);
+    }
+
+    // One badge for every processing state. The Shared Dataset, Run Pipeline and OCR views all use it.
+    const DOC_STATUS_BADGES = {
+        pending: ['badge-mute', 'Pending'],
+        processing: ['badge-primary', 'Processing'],
+        completed: ['badge-success', 'Completed'],
+        failed: ['badge-danger', 'Failed'],
+        cancelled: ['badge-cancelled', 'Cancelled'],
+    };
+    function renderDocStatusBadge(status) {
+        // Unknown values, including the legacy 'paused' that the API no longer returns, fall back to Pending.
+        const key = Object.prototype.hasOwnProperty.call(DOC_STATUS_BADGES, status) ? status : 'pending';
+        const [cls, label] = DOC_STATUS_BADGES[key];
+        return `<span class="badge doc-badge ${cls}" data-status="${key}">${label}</span>`;
     }
 
     function ocrCell(text, className) {
@@ -438,10 +489,11 @@
         tr.appendChild(ocrCell(doc.page_count ?? '--', 'ocr-col-num'));
         const size = Number.isFinite(doc.size_chars) ? `${doc.size_chars.toLocaleString()} chars` : '--';
         tr.appendChild(ocrCell(size, 'ocr-col-num'));
-        tr.appendChild(ocrCell(fmtSavedAt(doc.created_at), 'ocr-col-saved'));
+        tr.appendChild(ocrCell(fmtDateTime(doc.created_at), 'ocr-col-saved'));
 
         const storedTd = document.createElement('td');
         storedTd.className = 'ocr-col-stored';
+        storedTd.innerHTML = renderDocStatusBadge(doc.status);
         if (doc.has_graph) storedTd.appendChild(ocrBadge('Graph', 'badge-primary'));
         if (doc.has_extraction) storedTd.appendChild(ocrBadge('Extraction', 'badge-info'));
         if (!doc.has_graph && !doc.has_extraction) storedTd.appendChild(ocrBadge('Text only', 'badge-mute'));
@@ -541,7 +593,7 @@
         const seq = ++ocrViewerSeq;
         ocrEl(scope, 'ViewerTitle').textContent = doc.doc_id;
         const ownerPart = OCR_SCOPES[scope].showOwner ? ` \u2022 owner ${doc.owner}` : '';
-        ocrEl(scope, 'ViewerMeta').textContent = `${doc.md_filename}${ownerPart} \u2022 saved ${fmtSavedAt(doc.created_at)}`;
+        ocrEl(scope, 'ViewerMeta').textContent = `${doc.md_filename}${ownerPart} \u2022 saved ${fmtDateTime(doc.created_at)}`;
         text.textContent = 'Loading…';
         viewer.classList.remove('hidden');
         viewer.scrollIntoView({ block: 'nearest' });
@@ -607,27 +659,7 @@
                 return;
             }
             host.innerHTML = '';
-            outs.forEach(o => {
-                const row = el('div', 'doc-item');
-                const info = el('div', 'doc-item-info');
-                const schema = o.schema_ref ? ` • schema: <code>${escapeHtml(o.schema_ref.schema_id || '--')}</code>` : '';
-                info.innerHTML = `
-                    <span class="doc-icon"></span>
-                    <div>
-                        <div class="doc-name">${escapeHtml(o.name)}</div>
-                        <div class="doc-meta">${fmtSize(o.size)} • ${new Date(o.modified).toLocaleString()}${schema}</div>
-                    </div>
-                `;
-                const actions = el('div', 'doc-item-actions');
-                const dl = el('button', 'btn btn-outline btn-sm');
-                dl.type = 'button';
-                dl.textContent = 'Download';
-                dl.addEventListener('click', () => downloadOutput('/me/outputs/output/', o.name));
-                actions.appendChild(dl);
-                row.appendChild(info);
-                row.appendChild(actions);
-                host.appendChild(row);
-            });
+            outs.forEach(o => host.appendChild(buildOutputRow('user', o)));
         } catch (e) {
             host.innerHTML = `<p class="muted">Failed to load outputs: ${e.message}</p>`;
         }
@@ -644,13 +676,14 @@
                 const row = el('div', 'doc-item');
                 const info = el('div', 'doc-item-info');
                 info.innerHTML = `
-                    <span class="doc-icon"></span>
+                    <span class="doc-icon" aria-hidden="true">${PDF_ICON_SVG}</span>
                     <div>
                         <div class="doc-name">${escapeHtml(d.name)}</div>
-                        <div class="doc-meta">${fmtSize(d.size)} • ${new Date(d.modified).toLocaleString()}</div>
+                        <div class="doc-meta">${fmtSize(d.size)} • ${fmtDateTime(d.modified)}</div>
                     </div>
                 `;
                 const actions = el('div', 'doc-item-actions');
+                actions.innerHTML = renderDocStatusBadge(d.status);
                 const delBtn = el('button', 'btn btn-danger btn-sm');
                 delBtn.type = 'button';
                 delBtn.textContent = 'Delete';
@@ -690,89 +723,156 @@
 
     // ======================= Upload Handlers =======================
 
-    (function setupUploads() {
-        // Admin upload
-        const zone = $('uploadZone');
-        const input = $('fileInput');
-        const browse = $('browseBtn');
+    // Client checks run before any request. Server errors are mapped to readable text below.
+    const UPLOAD_MAX_BYTES = 20 * 1024 * 1024; // matches MAX_UPLOAD_SIZE_BYTES in pipeline_routes.py
 
-        if (zone && input && browse) {
-            function handleFiles(files) {
-                const pdfs = Array.from(files).filter(f => f.type === 'application/pdf' || f.name.toLowerCase().endsWith('.pdf'));
-                if (!pdfs.length) return;
-                uploadAdminFiles(pdfs);
+    // Status text uses textContent, so a file name can never become markup.
+    function setUploadMessage(id, text, kind) {
+        const s = $(id);
+        if (!s) return;
+        s.className = 'status-box' + (kind ? ' ' + kind : '');
+        s.textContent = text;
+        s.classList.remove('hidden');
+    }
+
+    function checkUploadFiles(files, existingNames) {
+        const accepted = [];
+        const errors = [];
+        const seen = new Set(existingNames.map((n) => String(n).toLowerCase()));
+        files.forEach((f) => {
+            if (!f.name.toLowerCase().endsWith('.pdf')) {
+                errors.push(`"${f.name}" is not a PDF. Only .pdf files can be uploaded.`);
+            } else if (f.size > UPLOAD_MAX_BYTES) {
+                errors.push(`"${f.name}" is larger than the 20 MB limit.`);
+            } else if (seen.has(f.name.toLowerCase())) {
+                errors.push(`"${f.name}" is already in this list.`);
+            } else {
+                seen.add(f.name.toLowerCase());
+                accepted.push(f);
             }
+        });
+        return { accepted, errors };
+    }
 
-            zone.addEventListener('click', (e) => {
-                if (e.target.closest('#browseBtn')) return; // browse handles its own click
-                input.click();
-            });
-            browse.addEventListener('click', (e) => { e.preventDefault(); e.stopPropagation(); input.click(); });
-            input.addEventListener('change', (e) => { handleFiles(e.target.files); e.target.value = ''; });
-            zone.addEventListener('dragover', (e) => { e.preventDefault(); zone.classList.add('dragover'); });
-            zone.addEventListener('dragleave', () => zone.classList.remove('dragover'));
-            zone.addEventListener('drop', (e) => {
-                e.preventDefault();
-                zone.classList.remove('dragover');
-                handleFiles(e.dataTransfer.files);
-            });
-
-            async function uploadAdminFiles(files) {
-                const fd = new FormData();
-                files.forEach(f => fd.append('files', f, f.name));
-                showStatus('uploadStatus', `Uploading ${files.length} file(s)...`);
-                try {
-                    const res = await api('/documents/upload', { method: 'POST', body: fd });
-                    showStatus('uploadStatus', `Saved ${res.count} file(s): ${res.saved.join(', ')}`, 'success');
-                    loadDocuments();
-                } catch (e) {
-                    showStatus('uploadStatus', 'Upload failed: ' + e.message, 'error');
+    // XMLHttpRequest reports upload progress, which the fetch-based api() helper cannot.
+    function sendUploadRequest(path, files, onProgress) {
+        return new Promise((resolve, reject) => {
+            const fd = new FormData();
+            files.forEach((f) => fd.append('files', f, f.name));
+            const xhr = new XMLHttpRequest();
+            xhr.open('POST', API_BASE + path);
+            if (state.token) xhr.setRequestHeader('Authorization', 'Bearer ' + state.token);
+            xhr.upload.onprogress = (e) => {
+                if (e.lengthComputable) onProgress(e.loaded / e.total);
+            };
+            xhr.onload = () => {
+                let body = null;
+                try { body = JSON.parse(xhr.responseText); } catch (_) { body = null; }
+                if (xhr.status >= 200 && xhr.status < 300) {
+                    resolve(body || {});
+                    return;
                 }
-                setTimeout(() => hideStatus('uploadStatus'), 4000);
+                if (xhr.status === 401) {
+                    logout();
+                    reject(new Error('Session expired. Please log in again.'));
+                    return;
+                }
+                const detail = body && typeof body.detail === 'string' ? body.detail : '';
+                if (xhr.status === 413) reject(new Error('The file is larger than the 20 MB limit.'));
+                else if (xhr.status === 400) reject(new Error(detail || 'The server rejected the file. Check that it is a valid PDF.'));
+                else if (xhr.status >= 500) reject(new Error('The server could not save the file. Try again.'));
+                else reject(new Error(detail || `Upload failed (HTTP ${xhr.status}).`));
+            };
+            xhr.onerror = () => reject(new Error('Network error. Check your connection and try again.'));
+            xhr.send(fd);
+        });
+    }
+
+    // One wiring function for both dropzones (shared dataset and private documents).
+    function wireUploadZone(cfg) {
+        const { zone, input, progress, bar, statusId, path, existingNames, onDone } = cfg;
+        if (!zone || !input || !progress || !bar) return;
+        let busy = false;
+
+        async function handleFiles(fileList) {
+            const files = Array.from(fileList || []);
+            if (!files.length) return;
+            if (busy) {
+                setUploadMessage(statusId, 'An upload is already running. Wait for it to finish.', 'warn');
+                return;
+            }
+            const { accepted, errors } = checkUploadFiles(files, existingNames());
+            if (!accepted.length) {
+                setUploadMessage(statusId, errors.join(' '), 'error');
+                return;
+            }
+            busy = true;
+            zone.classList.add('is-uploading');
+            progress.classList.remove('hidden');
+            bar.style.width = '0%';
+            let shown = 0;
+            setUploadMessage(statusId, `Uploading ${accepted.length} file(s)...`, '');
+            try {
+                const res = await sendUploadRequest(path, accepted, (fraction) => {
+                    shown = Math.max(shown, fraction); // the bar never goes backwards
+                    bar.style.width = (shown * 100).toFixed(1) + '%';
+                });
+                bar.style.width = '100%';
+                const saved = Array.isArray(res.saved) ? res.saved.join(', ') : '';
+                const note = errors.length ? errors.join(' ') + ' ' : '';
+                setUploadMessage(statusId, `${note}Saved ${res.count ?? accepted.length} file(s): ${saved}`, 'success');
+                onDone();
+            } catch (e) {
+                setUploadMessage(statusId, 'Upload failed: ' + e.message, 'error');
+            } finally {
+                busy = false;
+                zone.classList.remove('is-uploading');
+                setTimeout(() => progress.classList.add('hidden'), 600);
+                setTimeout(() => hideStatus(statusId), 6000);
             }
         }
 
-        // User private upload
-        const uZone = $('userUploadZone');
-        const uInput = $('userFileInput');
-        const uBrowse = $('userBrowseBtn');
+        zone.addEventListener('dragenter', (e) => { e.preventDefault(); zone.classList.add('dragover'); });
+        zone.addEventListener('dragover', (e) => {
+            e.preventDefault();
+            if (e.dataTransfer) e.dataTransfer.dropEffect = 'copy';
+            zone.classList.add('dragover');
+        });
+        zone.addEventListener('dragleave', (e) => {
+            if (!zone.contains(e.relatedTarget)) zone.classList.remove('dragover');
+        });
+        zone.addEventListener('drop', (e) => {
+            e.preventDefault();
+            zone.classList.remove('dragover');
+            handleFiles(e.dataTransfer.files);
+        });
+        input.addEventListener('change', () => {
+            handleFiles(input.files);
+            input.value = '';
+        });
+    }
 
-        if (uZone && uInput && uBrowse) {
-            function handleUserFiles(files) {
-                const pdfs = Array.from(files).filter(f => f.type === 'application/pdf' || f.name.toLowerCase().endsWith('.pdf'));
-                if (!pdfs.length) return;
-                uploadUserFiles(pdfs);
-            }
+    wireUploadZone({
+        zone: $('uploadZone'),
+        input: $('fileInput'),
+        progress: $('uploadProgress'),
+        bar: $('uploadProgressBar'),
+        statusId: 'uploadStatus',
+        path: '/documents/upload',
+        existingNames: () => state.docs.map((d) => d.name),
+        onDone: () => loadDocuments(),
+    });
 
-            uZone.addEventListener('click', (e) => {
-                if (e.target.closest('#userBrowseBtn')) return; // browse handles its own click
-                uInput.click();
-            });
-            uBrowse.addEventListener('click', (e) => { e.preventDefault(); e.stopPropagation(); uInput.click(); });
-            uInput.addEventListener('change', (e) => { handleUserFiles(e.target.files); e.target.value = ''; });
-            uZone.addEventListener('dragover', (e) => { e.preventDefault(); uZone.classList.add('dragover'); });
-            uZone.addEventListener('dragleave', () => uZone.classList.remove('dragover'));
-            uZone.addEventListener('drop', (e) => {
-                e.preventDefault();
-                uZone.classList.remove('dragover');
-                handleUserFiles(e.dataTransfer.files);
-            });
-
-            async function uploadUserFiles(files) {
-                const fd = new FormData();
-                files.forEach(f => fd.append('files', f, f.name));
-                showStatus('userUploadStatus', `Uploading ${files.length} private file(s)...`);
-                try {
-                    const res = await api('/me/documents', { method: 'POST', body: fd });
-                    showStatus('userUploadStatus', `Saved ${res.count} file(s): ${res.saved.join(', ')}`, 'success');
-                    loadUserDocuments();
-                } catch (e) {
-                    showStatus('userUploadStatus', 'Upload failed: ' + e.message, 'error');
-                }
-                setTimeout(() => hideStatus('userUploadStatus'), 4000);
-            }
-        }
-    })();
+    wireUploadZone({
+        zone: $('userUploadZone'),
+        input: $('userFileInput'),
+        progress: $('userUploadProgress'),
+        bar: $('userUploadProgressBar'),
+        statusId: 'userUploadStatus',
+        path: '/me/documents',
+        existingNames: () => state.userDocs.map((d) => d.name),
+        onDone: () => loadUserDocuments(),
+    });
 
     if ($('refreshDocsBtn')) $('refreshDocsBtn').addEventListener('click', loadDocuments);
     if ($('refreshUserDocsBtn')) $('refreshUserDocsBtn').addEventListener('click', loadUserDocuments);
@@ -1332,7 +1432,7 @@
                 <input type="checkbox" class="doc-check" value="${escapeHtml(d.name)}" checked>
                 <span class="cname">${escapeHtml(d.name)}</span>
                 <span class="cmeta">${fmtSize(d.size)}</span>
-                <span class="cmeta">${d.has_output ? 're-run' : 'pending'}</span>
+                <span class="cmeta">${renderDocStatusBadge(d.status)}</span>
             `;
             host.appendChild(row);
         });
@@ -1417,7 +1517,6 @@
         return {
             queued: 'badge-warn',
             running: 'badge-info',
-            paused: 'badge-warn',
             killed: 'badge-danger',
             completed: 'badge-success'
         }[s] || 'badge-mute';
@@ -1451,8 +1550,6 @@
     function ocrState(progress, status) {
         if (status === 'completed' || progress.phase === 'finished') return 'completed';
         if (status === 'killed' || progress.phase === 'killed') return progress.stopping ? 'stopping' : 'stopped';
-        // The worker only pauses between documents. Until it parks, the job is still busy.
-        if (status === 'paused') return progress.paused_since ? 'paused' : 'pausing';
         if (progress.phase === 'queued' || status === 'queued') return 'queued';
         if (progress.phase === 'rendering') return 'preparing';
         if (progress.phase === 'extracting') return 'extracting';
@@ -1460,6 +1557,22 @@
         if (progress.phase === 'saving') return 'saving';
         if (!(progress.pages_total > 0)) return 'counting';
         return 'running';
+    }
+
+    // Highest percentage shown so far for each job. The bar never moves backwards, even
+    // when a poll reports a smaller value (for example when the page total is revised).
+    const ocrShownPct = new Map();
+
+    // Jobs that are still doing OCR, from the last list poll. Only these are fetched every second.
+    let liveOcrJobIds = new Set();
+    const liveOcrStatus = new Map();
+    let liveOcrPollBusy = false;
+
+    function displayPct(key, pct) {
+        const prev = ocrShownPct.get(key);
+        const next = prev === undefined ? pct : Math.max(prev, pct);
+        ocrShownPct.set(key, next);
+        return next;
     }
 
     // Everything the progress UI needs. progress is null for jobs created before
@@ -1471,6 +1584,7 @@
             const docsDone = Math.min(fb.docsDone || 0, docsTotal);
             return {
                 legacy: true,
+                key: '',
                 state: 'legacy',
                 pct: docsTotal ? Math.round(100 * docsDone / docsTotal) : 0,
                 indeterminate: false,
@@ -1495,6 +1609,8 @@
         const docNo = docsTotal ? Math.min(docsDone + 1, docsTotal) : 0;
         const pagePart = total ? `Page ${done} of ${total}` : '';
         const docPart = docsTotal ? `Document ${docNo} of ${docsTotal}` : '';
+        const inFlight = Number(progress.pages_in_flight) || 0;
+        const flightPart = state === 'running' && inFlight > 0 ? `${inFlight} in flight` : '';
         const currentDoc = progress.current_doc || null;
         const eta = Number.isFinite(progress.eta_s) ? progress.eta_s : null;
         const etaPhrase = eta === null ? 'Calculating...' : formatEta(eta);
@@ -1502,13 +1618,14 @@
 
         const m = {
             legacy: false,
+            key: fb.key || '',
             state,
             pct,
             indeterminate: false,
             barClass: '',
             statusText: '',
             statusTone: '',
-            caption: [pagePart, docPart].filter(Boolean).join('  \u2022  '),
+            caption: [pagePart, flightPart, docPart].filter(Boolean).join('  \u2022  '),
             note: '',
             currentDoc: null,
             etaText: etaPhrase,
@@ -1530,6 +1647,9 @@
             case 'preparing':
                 m.statusText = 'Preparing document';
                 m.caption = m.caption || 'Rendering pages';
+                // Rendering runs before the first page is OCR'd, so the bar moves but shows no value yet.
+                m.indeterminate = true;
+                m.pct = null;
                 m.etaText = '--';
                 m.currentDoc = currentDoc;
                 m.rowText = 'Preparing document';
@@ -1544,9 +1664,20 @@
                 break;
             case 'running':
                 m.statusText = 'OCR running';
-                m.caption = m.caption || 'Preparing pages';
                 m.currentDoc = currentDoc;
-                m.rowText = `${m.pagesText} pages \u2022 ${eta === null ? 'estimating time left' : formatEta(eta) + ' left'}`;
+                if (done === 0) {
+                    // No page has finished, so there is no rate yet. Show a moving bar, not a frozen 0%.
+                    m.indeterminate = true;
+                    m.pct = null;
+                    m.caption = [total ? `Waiting for first page of ${total}` : 'Waiting for first page', flightPart]
+                        .filter(Boolean)
+                        .join('  \u2022  ');
+                    m.etaText = '--';
+                    m.rowText = `${m.pagesText} pages \u2022 waiting for first page`;
+                } else {
+                    m.caption = m.caption || 'Preparing pages';
+                    m.rowText = `${m.pagesText} pages \u2022 ${eta === null ? 'estimating time left' : formatEta(eta) + ' left'}`;
+                }
                 break;
             case 'extracting':
                 m.statusText = 'Extracting fields';
@@ -1554,27 +1685,10 @@
                 m.currentDoc = currentDoc;
                 m.rowText = `${m.pagesText} pages \u2022 extracting fields`;
                 break;
-            case 'pausing':
-                m.statusText = 'Pausing';
-                m.statusTone = 'is-paused';
-                m.barClass = 'is-paused';
-                m.note = 'The current document finishes first, then the job pauses.';
-                m.currentDoc = currentDoc;
-                m.rowText = `${m.pagesText} pages \u2022 pausing after this document`;
-                break;
-            case 'paused':
-                m.statusText = 'Paused';
-                m.statusTone = 'is-paused';
-                m.barClass = 'is-paused';
-                m.note = 'The job is waiting. Resume to continue.';
-                m.etaText = 'Paused';
-                m.currentDoc = currentDoc;
-                m.rowText = `${m.pagesText} pages \u2022 paused`;
-                break;
             case 'stopping':
                 m.statusText = 'Stopping after this document';
-                m.statusTone = 'is-paused';
-                m.barClass = 'is-paused';
+                m.statusTone = 'is-stopping';
+                m.barClass = 'is-stopping';
                 m.note = 'The current document finishes first, then the job stops.';
                 m.currentDoc = currentDoc;
                 m.rowText = `${m.pagesText} pages \u2022 stopping after this document`;
@@ -1623,9 +1737,11 @@
                 break;
         }
 
+        if (fb.key && m.pct !== null) m.pct = displayPct(fb.key, m.pct);
+
         // Two timers, each with its own value from the server. A timer runs while its
         // start timestamp is set and its finish timestamp is not. The totals include
-        // every document of the job, and pauses are already excluded by the server.
+        // every document of the job.
         const ocrSeconds = Number(progress.ocr_elapsed_s ?? progress.ocr_s) || 0;
         const graphSeconds = Number(progress.graph_elapsed_s) || 0;
         const ocrRunning = Boolean(progress.ocr_started_at) && !progress.ocr_finished_at;
@@ -1666,12 +1782,37 @@
             .filter(Boolean)
             .join(' ');
         const style = m.indeterminate ? '' : ` style="width:${m.pct === null ? 0 : m.pct}%"`;
-        return `<div class="progress-bar-wrap" ${ocrBarAttrs(m)}><div class="${cls}"${style}></div></div>`;
+        return `<div class="progress-bar-wrap" data-ocr-bar="${escapeHtml(m.key)}" ${ocrBarAttrs(m)}><div class="${cls}"${style}></div></div>`;
     }
 
     function ocrRowTextMarkup(m) {
         if (m.legacy || !m.rowText) return '';
-        return `<div class="job-meta ocr-row-text">${escapeHtml(m.rowText)}</div>`;
+        return `<div class="job-meta ocr-row-text" data-ocr-text="${escapeHtml(m.key)}">${escapeHtml(m.rowText)}</div>`;
+    }
+
+    // Updates a row bar that is already on screen. The fill element is kept, so the CSS
+    // width transition runs from the old value to the new one.
+    function paintRowBar(wrap, m) {
+        const fill = wrap.querySelector('.progress-bar-fill');
+        if (!fill) return;
+        // Leaving the indeterminate segment (30% wide) must not animate down to the first value.
+        const leavingIndeterminate = fill.classList.contains('is-indeterminate') && !m.indeterminate;
+        if (leavingIndeterminate) fill.style.transition = 'none';
+        fill.className = ['progress-bar-fill', 'ocr-fill', m.barClass, m.indeterminate ? 'is-indeterminate' : '']
+            .filter(Boolean)
+            .join(' ');
+        fill.style.width = m.indeterminate ? '' : `${m.pct === null ? 0 : m.pct}%`;
+        if (leavingIndeterminate) {
+            void fill.offsetWidth; // commit the new width before the transition is switched back on
+            fill.style.transition = '';
+        }
+        if (m.indeterminate || m.pct === null) {
+            wrap.removeAttribute('aria-valuenow');
+            wrap.setAttribute('aria-valuetext', m.caption || m.statusText);
+        } else {
+            wrap.setAttribute('aria-valuenow', String(m.pct));
+            wrap.setAttribute('aria-valuetext', `${m.pct}% of pages. ${m.caption}`);
+        }
     }
 
     // Data attributes that let tickOcrElapsed count a running timer between polls.
@@ -1751,6 +1892,7 @@
     // panel is redrawn on the next poll.
     function renderJobProgressPanel(host, job) {
         const m = ocrModel(job.progress, job.status, {
+            key: job.job_id,
             docsDone: (job.successes || []).length + (job.failures || []).length,
             docsTotal: (job.targets || []).length,
             strategy: job.strategy,
@@ -1782,25 +1924,53 @@
         });
     }
 
-    async function pauseJob(jobId, e) {
-        if (e) e.stopPropagation();
-        try {
-            await api(`/pipeline/jobs/${jobId}/pause`, { method: 'POST' });
-            loadJobs();
-            if (state.selectedJobId === jobId) loadJobDetail(jobId);
-        } catch (err) {
-            alert('Failed to pause job: ' + err.message);
+    function isLiveOcrJob(j) {
+        return j.status === 'running' || j.status === 'queued';
+    }
+
+    function setLiveOcrJobs(jobs) {
+        liveOcrJobIds = new Set(jobs.filter(isLiveOcrJob).map((j) => j.job_id));
+    }
+
+    // Redraws one job's row bar, row text and (when open) detail panel from a fresh job detail.
+    function applyLiveOcrJob(j) {
+        const docsDone = j.completed ?? ((j.succeeded || 0) + (j.failed || 0));
+        const docsTotal = j.total ?? (j.targets || []).length;
+        const m = ocrModel(j.progress, j.status, { key: j.job_id, docsDone, docsTotal, strategy: j.strategy });
+        const esc = (value) => (window.CSS && CSS.escape ? CSS.escape(value) : value);
+        document.querySelectorAll(`[data-ocr-bar="${esc(j.job_id)}"]`).forEach((wrap) => paintRowBar(wrap, m));
+        document.querySelectorAll(`[data-ocr-text="${esc(j.job_id)}"]`).forEach((node) => {
+            node.textContent = m.rowText;
+        });
+        if (state.selectedJobId === j.job_id) {
+            const host = state.role === 'user' ? $('userJobProgress') : $('adminJobProgress');
+            if (host && j.progress) renderJobProgressPanel(host, j);
+        }
+        // A status change (for example running to completed) reloads the lists once, so the
+        // dataset, status badges and outputs follow without a manual refresh.
+        const prev = liveOcrStatus.get(j.job_id);
+        liveOcrStatus.set(j.job_id, j.status);
+        if (prev !== undefined && prev !== j.status) {
+            if (state.role === 'user') loadUserJobs();
+            else loadJobs();
         }
     }
 
-    async function resumeJob(jobId, e) {
-        if (e) e.stopPropagation();
+    // Polls each live OCR job's detail once per second. Skips a tick while the last one is still in flight.
+    async function pollLiveOcrJobs() {
+        if (liveOcrPollBusy || !state.token || liveOcrJobIds.size === 0) return;
+        liveOcrPollBusy = true;
         try {
-            await api(`/pipeline/jobs/${jobId}/resume`, { method: 'POST' });
-            loadJobs();
-            if (state.selectedJobId === jobId) loadJobDetail(jobId);
-        } catch (err) {
-            alert('Failed to resume job: ' + err.message);
+            const base = state.role === 'user' ? '/me/pipeline/jobs/' : '/pipeline/jobs/';
+            await Promise.all([...liveOcrJobIds].map(async (id) => {
+                try {
+                    applyLiveOcrJob(await api(base + id));
+                } catch (e) {
+                    // The 4 s list poll retries this job on its next pass.
+                }
+            }));
+        } finally {
+            liveOcrPollBusy = false;
         }
     }
 
@@ -1816,12 +1986,21 @@
         }
     }
 
+    // Last job-state signature seen by the poll. A change refreshes the document, OCR and Outputs views once.
+    let adminJobSignature = null;
     async function loadJobs() {
         if (state.role !== 'admin') return;
         try {
             const data = await api('/pipeline/status');
             const jobs = Object.values(data.jobs || {});
             state.jobs = jobs;
+            setLiveOcrJobs(jobs);
+            const signature = jobs
+                .map(j => `${j.job_id}|${j.status}|${j.completed || 0}|${j.current_document || ''}`)
+                .sort()
+                .join('\n');
+            if (adminJobSignature !== null && signature !== adminJobSignature) loadDocuments();
+            adminJobSignature = signature;
             const host = $('jobList');
             if (!host) return;
             if (!jobs.length) {
@@ -1833,18 +2012,12 @@
             jobs.forEach(j => {
                 const done = j.completed || 0;
                 const total = j.total || 0;
-                const ocr = ocrModel(j.progress, j.status, { docsDone: done, docsTotal: total, strategy: j.strategy });
+                const ocr = ocrModel(j.progress, j.status, { key: j.job_id, docsDone: done, docsTotal: total, strategy: j.strategy });
                 const row = el('div', 'job-item');
 
                 let actionButtons = '';
                 if (j.status === 'running' || j.status === 'queued') {
                     actionButtons = `
-                        <button class="btn btn-ghost btn-sm" title="Pause job" data-action="pause" data-job="${escapeHtml(j.job_id)}"></button>
-                        <button class="btn btn-ghost btn-sm" title="Kill job" style="color:#fca5a5" data-action="kill" data-job="${escapeHtml(j.job_id)}"></button>
-                    `;
-                } else if (j.status === 'paused') {
-                    actionButtons = `
-                        <button class="btn btn-ghost btn-sm" title="Resume job" style="color:#6ee7b7" data-action="resume" data-job="${escapeHtml(j.job_id)}"></button>
                         <button class="btn btn-ghost btn-sm" title="Kill job" style="color:#fca5a5" data-action="kill" data-job="${escapeHtml(j.job_id)}"></button>
                     `;
                 }
@@ -1852,7 +2025,7 @@
                 row.innerHTML = `
                     <div class="job-item-left">
                         <div class="job-id">${escapeHtml(j.job_id)}</div>
-                        <div class="job-meta">${escapeHtml(j.created_at || '')} • schema: ${escapeHtml(j.schema_id || '--')} • ${done}/${total} docs</div>
+                        <div class="job-meta">${escapeHtml(fmtDateTime(j.created_at))} • schema: ${escapeHtml(j.schema_id || '--')} • ${done}/${total} docs</div>
                         ${ocrRowTextMarkup(ocr)}
                     </div>
                     <div class="job-item-right">
@@ -1867,9 +2040,7 @@
                         e.stopPropagation();
                         const act = btn.dataset.action;
                         const jid = btn.dataset.job;
-                        if (act === 'pause') pauseJob(jid, e);
-                        else if (act === 'resume') resumeJob(jid, e);
-                        else if (act === 'kill') killJob(jid, e);
+                        if (act === 'kill') killJob(jid, e);
                         return;
                     }
                     loadJobDetail(j.job_id, true);
@@ -1879,28 +2050,6 @@
             if (state.selectedJobId) loadJobDetail(state.selectedJobId, false);
         } catch (e) {
             console.warn('loadJobs failed', e);
-        }
-    }
-
-    async function pauseUserJob(jobId, e) {
-        if (e) e.stopPropagation();
-        try {
-            await api(`/me/pipeline/jobs/${jobId}/pause`, { method: 'POST' });
-            loadUserJobs();
-            loadJobDetail(jobId);
-        } catch (err) {
-            alert('Pause failed: ' + err.message);
-        }
-    }
-
-    async function resumeUserJob(jobId, e) {
-        if (e) e.stopPropagation();
-        try {
-            await api(`/me/pipeline/jobs/${jobId}/resume`, { method: 'POST' });
-            loadUserJobs();
-            loadJobDetail(jobId);
-        } catch (err) {
-            alert('Resume failed: ' + err.message);
         }
     }
 
@@ -1940,27 +2089,10 @@
                 st.className = 'badge ' + jobStatusBadgeClass(j.status);
             }
 
-            const pauseBtn = isUser ? ($('userJobPauseBtn') || $('jobPauseBtn')) : $('jobPauseBtn');
-            const resumeBtn = isUser ? ($('userJobResumeBtn') || $('jobResumeBtn')) : $('jobResumeBtn');
             const killBtn = isUser ? ($('userJobKillBtn') || $('jobKillBtn')) : $('jobKillBtn');
 
-            if (pauseBtn && resumeBtn && killBtn) {
-                if (j.status === 'running' || j.status === 'queued') {
-                    pauseBtn.classList.remove('hidden');
-                    resumeBtn.classList.add('hidden');
-                    killBtn.classList.remove('hidden');
-                } else if (j.status === 'paused') {
-                    pauseBtn.classList.add('hidden');
-                    resumeBtn.classList.remove('hidden');
-                    killBtn.classList.remove('hidden');
-                } else {
-                    pauseBtn.classList.add('hidden');
-                    resumeBtn.classList.add('hidden');
-                    killBtn.classList.add('hidden');
-                }
-
-                pauseBtn.onclick = (e) => isUser ? pauseUserJob(jobId, e) : pauseJob(jobId, e);
-                resumeBtn.onclick = (e) => isUser ? resumeUserJob(jobId, e) : resumeJob(jobId, e);
+            if (killBtn) {
+                killBtn.classList.toggle('hidden', !(j.status === 'running' || j.status === 'queued'));
                 killBtn.onclick = (e) => isUser ? killUserJob(jobId, e) : killJob(jobId, e);
             }
 
@@ -2224,12 +2356,20 @@
         });
     }
 
+    let userJobSignature = null;
     async function loadUserJobs() {
         if (state.role !== 'user') return;
         try {
             const data = await api('/me/pipeline/status');
             const jobs = data.jobs || [];
             state.userJobs = jobs;
+            setLiveOcrJobs(jobs);
+            const signature = jobs
+                .map(j => `${j.job_id}|${j.status}|${j.succeeded || 0}|${j.failed || 0}|${j.currently_processing || ''}`)
+                .sort()
+                .join('\n');
+            if (userJobSignature !== null && signature !== userJobSignature) loadUserDocuments();
+            userJobSignature = signature;
             const host = $('userJobList');
             if (!host) return;
 
@@ -2243,18 +2383,12 @@
             jobs.forEach(j => {
                 const total = j.total || 0;
                 const done = (j.succeeded || 0) + (j.failed || 0);
-                const ocr = ocrModel(j.progress, j.status, { docsDone: done, docsTotal: total });
+                const ocr = ocrModel(j.progress, j.status, { key: j.job_id, docsDone: done, docsTotal: total });
                 const row = el('div', 'user-job-row');
 
                 let actionButtons = '';
                 if (j.status === 'running' || j.status === 'queued') {
                     actionButtons = `
-                        <button class="btn btn-ghost btn-sm" title="Pause job" data-action="pause" data-job="${escapeHtml(j.job_id)}">Pause</button>
-                        <button class="btn btn-ghost btn-sm" title="Kill job" style="color:#fca5a5" data-action="kill" data-job="${escapeHtml(j.job_id)}">Kill</button>
-                    `;
-                } else if (j.status === 'paused') {
-                    actionButtons = `
-                        <button class="btn btn-ghost btn-sm" title="Resume job" style="color:#6ee7b7" data-action="resume" data-job="${escapeHtml(j.job_id)}">Resume</button>
                         <button class="btn btn-ghost btn-sm" title="Kill job" style="color:#fca5a5" data-action="kill" data-job="${escapeHtml(j.job_id)}">Kill</button>
                     `;
                 } else if (j.status === 'completed' || j.succeeded > 0) {
@@ -2307,9 +2441,7 @@
                                 downloadJobPdf(jid);
                                 return;
                             }
-                            if (act === 'pause') await api(`/me/pipeline/jobs/${jid}/pause`, { method: 'POST' });
-                            else if (act === 'resume') await api(`/me/pipeline/jobs/${jid}/resume`, { method: 'POST' });
-                            else if (act === 'kill') {
+                            if (act === 'kill') {
                                 if (!confirm(`Cancel job ${jid}?`)) return;
                                 await api(`/me/pipeline/jobs/${jid}/kill`, { method: 'POST' });
                             }
@@ -2334,22 +2466,84 @@
 
     // ======================= Admin Logs Viewer =======================
 
-    async function loadUserActivityLogs() {
-        if (state.role !== 'admin') return;
+    // Log lines and cells are escaped first. Search matches are wrapped in <mark> after escaping.
+    const LOG_LEVEL_RE = /\b(CRITICAL|ERROR|WARNING|WARN|INFO|DEBUG)\b/;
+    const logState = { systemLines: [], userLogs: [] };
+
+    function logLevelOf(line) {
+        const m = LOG_LEVEL_RE.exec(line);
+        if (!m) return '';
+        if (m[1] === 'CRITICAL' || m[1] === 'ERROR') return 'ERROR';
+        if (m[1] === 'WARNING' || m[1] === 'WARN') return 'WARN';
+        return m[1];
+    }
+
+    function highlightText(text, query) {
+        const raw = String(text === null || text === undefined ? '' : text);
+        if (!query) return escapeHtml(raw);
+        const lower = raw.toLowerCase();
+        const q = query.toLowerCase();
+        let out = '';
+        let pos = 0;
+        let idx = lower.indexOf(q, pos);
+        while (idx !== -1) {
+            out += escapeHtml(raw.slice(pos, idx)) + '<mark>' + escapeHtml(raw.slice(idx, idx + q.length)) + '</mark>';
+            pos = idx + q.length;
+            idx = lower.indexOf(q, pos);
+        }
+        return out + escapeHtml(raw.slice(pos));
+    }
+
+    function setLogStatus(id, text) {
+        const node = $(id);
+        if (node) node.textContent = text;
+    }
+
+    function filteredSystemLines() {
+        const query = $('systemLogSearch') ? $('systemLogSearch').value.trim().toLowerCase() : '';
+        const level = $('systemLogLevel') ? $('systemLogLevel').value : '';
+        return logState.systemLines.filter((line) => {
+            if (level && logLevelOf(line) !== level) return false;
+            return !query || line.toLowerCase().includes(query);
+        });
+    }
+
+    function renderSystemLogs() {
+        const host = $('systemLogsList');
+        if (!host) return;
+        const query = $('systemLogSearch') ? $('systemLogSearch').value.trim() : '';
+        const lines = filteredSystemLines();
+        if (!logState.systemLines.length) {
+            host.innerHTML = '<span class="muted">No system logs recorded yet.</span>';
+        } else if (!lines.length) {
+            host.innerHTML = '<span class="muted">No lines match the current search or level filter.</span>';
+        } else {
+            host.innerHTML = lines.map((line) => {
+                const lv = logLevelOf(line);
+                const cls = lv === 'ERROR' ? ' is-error' : (lv === 'WARN' ? ' is-warn' : '');
+                return `<span class="log-line${cls}">${highlightText(line, query)}</span>`;
+            }).join('');
+        }
+        setLogStatus('systemLogStatus', `${lines.length} of ${logState.systemLines.length} lines`);
+        if ($('systemLogTail') && $('systemLogTail').checked) host.scrollTop = host.scrollHeight;
+    }
+
+    function renderUserLogs() {
         const host = $('userLogsList');
         if (!host) return;
-        const filterUser = $('logFilterUsername') ? $('logFilterUsername').value.trim() : '';
+        const query = $('userLogSearch') ? $('userLogSearch').value.trim() : '';
+        const needle = query.toLowerCase();
+        const logs = logState.userLogs.slice().reverse().filter((l) => {
+            if (!needle) return true;
+            const text = [l.timestamp, l.username, l.action, JSON.stringify(l.detail)].join(' ').toLowerCase();
+            return text.includes(needle);
+        });
 
-        try {
-            const path = '/admin/logs/users' + (filterUser ? `?username=${encodeURIComponent(filterUser)}` : '');
-            const data = await api(path);
-            const logs = data.logs || [];
-
-            if (!logs.length) {
-                host.innerHTML = '<p class="muted">No user activity recorded yet.</p>';
-                return;
-            }
-
+        if (!logState.userLogs.length) {
+            host.innerHTML = '<p class="muted">No user activity recorded yet.</p>';
+        } else if (!logs.length) {
+            host.innerHTML = '<p class="muted">No entries match the current search.</p>';
+        } else {
             let html = `
                 <table class="log-table">
                     <thead>
@@ -2362,22 +2556,36 @@
                     </thead>
                     <tbody>
             `;
-
-            logs.slice().reverse().forEach(l => {
+            logs.forEach((l) => {
                 html += `
                     <tr>
-                        <td class="muted small">${escapeHtml(l.timestamp)}</td>
-                        <td><strong>${escapeHtml(l.username)}</strong></td>
-                        <td><span class="badge badge-info">${escapeHtml(l.action)}</span></td>
-                        <td><code style="font-size:11px;">${escapeHtml(JSON.stringify(l.detail))}</code></td>
+                        <td class="muted small">${highlightText(l.timestamp, query)}</td>
+                        <td><strong>${highlightText(l.username, query)}</strong></td>
+                        <td><span class="badge badge-info">${highlightText(l.action, query)}</span></td>
+                        <td><code style="font-size:11px;">${highlightText(JSON.stringify(l.detail), query)}</code></td>
                     </tr>
                 `;
             });
-
             html += '</tbody></table>';
             host.innerHTML = html;
+        }
+        setLogStatus('userLogStatus', `${logs.length} of ${logState.userLogs.length} entries`);
+    }
+
+    async function loadUserActivityLogs() {
+        if (state.role !== 'admin') return;
+        const host = $('userLogsList');
+        if (!host) return;
+        const filterUser = $('logFilterUsername') ? $('logFilterUsername').value.trim() : '';
+
+        try {
+            const path = '/admin/logs/users' + (filterUser ? `?username=${encodeURIComponent(filterUser)}` : '');
+            const data = await api(path);
+            logState.userLogs = data.logs || [];
+            renderUserLogs();
         } catch (e) {
-            host.innerHTML = `<p class="muted">Error loading user logs: ${e.message}</p>`;
+            logState.userLogs = [];
+            host.innerHTML = `<p class="muted">Error loading user logs: ${escapeHtml(e.message)}</p>`;
         }
     }
 
@@ -2388,17 +2596,98 @@
 
         try {
             const data = await api('/admin/logs/system?limit=300');
-            const lines = data.lines || [];
-            if (!lines.length) {
-                host.textContent = 'No system logs recorded yet.';
-            } else {
-                host.textContent = lines.join('\n');
-                host.scrollTop = host.scrollHeight;
-            }
+            logState.systemLines = (data.lines || []).map((line) => String(line));
+            renderSystemLogs();
         } catch (e) {
+            logState.systemLines = [];
             host.textContent = 'Error loading system logs: ' + e.message;
         }
     }
+
+    function copyTextToClipboard(text) {
+        if (navigator.clipboard && window.isSecureContext) {
+            return navigator.clipboard.writeText(text);
+        }
+        return new Promise((resolve, reject) => {
+            const ta = document.createElement('textarea');
+            ta.value = text;
+            ta.setAttribute('readonly', '');
+            ta.style.position = 'fixed';
+            ta.style.opacity = '0';
+            document.body.appendChild(ta);
+            ta.select();
+            const ok = document.execCommand('copy');
+            ta.remove();
+            ok ? resolve() : reject(new Error('copy not permitted'));
+        });
+    }
+
+    function setupLogControls() {
+        const host = $('systemLogsList');
+        const tail = $('systemLogTail');
+        const search = $('systemLogSearch');
+        const level = $('systemLogLevel');
+        const userSearch = $('userLogSearch');
+
+        if (search) search.addEventListener('input', renderSystemLogs);
+        if (level) level.addEventListener('change', renderSystemLogs);
+        if (userSearch) userSearch.addEventListener('input', renderUserLogs);
+
+        // Tail follows the newest line. Scrolling up pauses it; reaching the bottom again does not restart it.
+        if (host && tail) {
+            host.addEventListener('scroll', () => {
+                const nearBottom = host.scrollHeight - host.scrollTop - host.clientHeight < 16;
+                if (!nearBottom && tail.checked) tail.checked = false;
+            });
+            tail.addEventListener('change', () => {
+                if (tail.checked) host.scrollTop = host.scrollHeight;
+            });
+        }
+
+        const copyBtn = $('copyLogsBtn');
+        if (copyBtn) {
+            copyBtn.addEventListener('click', async () => {
+                const text = filteredSystemLines().join('\n');
+                try {
+                    await copyTextToClipboard(text);
+                    setLogStatus('systemLogStatus', `Copied ${filteredSystemLines().length} lines`);
+                } catch (e) {
+                    setLogStatus('systemLogStatus', 'Copy failed: ' + e.message);
+                }
+            });
+        }
+
+        const dlBtn = $('downloadLogsBtn');
+        if (dlBtn) {
+            dlBtn.addEventListener('click', () => {
+                const lines = filteredSystemLines();
+                const blob = new Blob([lines.join('\n') + '\n'], { type: 'text/plain;charset=utf-8' });
+                const url = URL.createObjectURL(blob);
+                const stamp = new Date().toISOString().replace(/[:.]/g, '-');
+                const a = document.createElement('a');
+                a.href = url;
+                a.download = `system-logs-${stamp}.txt`;
+                document.body.appendChild(a);
+                a.click();
+                a.remove();
+                setTimeout(() => URL.revokeObjectURL(url), 1000);
+            });
+        }
+    }
+
+    // Auto-refresh every 5 s, only for the admin Logs tab and only while its toggle is on.
+    setInterval(() => {
+        if (!state.token || state.role !== 'admin') return;
+        const tab = $('tab-logs');
+        if (!tab || !tab.classList.contains('active')) return;
+        if ($('systemLogsPanel') && !$('systemLogsPanel').classList.contains('hidden')) {
+            if ($('systemLogAutoRefresh') && $('systemLogAutoRefresh').checked) loadSystemLogs();
+        } else if ($('userLogAutoRefresh') && $('userLogAutoRefresh').checked) {
+            loadUserActivityLogs();
+        }
+    }, 5000);
+
+    setupLogControls();
 
     if ($('logSubTabUsersBtn') && $('logSubTabSystemBtn')) {
         $('logSubTabUsersBtn').addEventListener('click', () => {
@@ -2508,11 +2797,125 @@
         });
     }
 
+    // ======================= Admin Graph Builds =======================
+
+    function graphBuildStatusHtml(b) {
+        if (b.is_empty) return '<span class="badge badge-danger">Empty (0 nodes)</span>';
+        const parts = [];
+        if (b.in_use) parts.push('<span class="badge badge-primary">In use</span>');
+        if (b.is_active) parts.push('<span class="badge badge-ok-green">Admin choice</span>');
+        if (!parts.length) parts.push('<span class="badge badge-secondary">Available</span>');
+        return parts.join(' ');
+    }
+
+    function renderGraphBuilds(docs) {
+        const host = $('graphBuildsList');
+        if (!host) return;
+        if (!docs.length) {
+            host.innerHTML = '<p class="muted">No graph builds found.</p>';
+            return;
+        }
+        host.innerHTML = docs.map(d => {
+            const owner = d.owner || '';
+            const rows = d.builds.map(b => `
+                <tr class="${b.is_empty ? 'row-empty' : ''}">
+                    <td class="muted small">${escapeHtml(b.job_id || '-')}</td>
+                    <td>${escapeHtml(b.created_at ? new Date(b.created_at).toLocaleString() : '-')}</td>
+                    <td>${escapeHtml(b.node_count)}</td>
+                    <td>${escapeHtml(b.edge_count)}</td>
+                    <td>${graphBuildStatusHtml(b)}</td>
+                    <td>
+                        <button class="btn btn-outline btn-sm" data-action="select"
+                            data-doc-id="${escapeHtml(d.doc_id)}" data-owner="${escapeHtml(owner)}"
+                            data-job-id="${escapeHtml(b.job_id || '')}"
+                            ${b.selectable ? '' : 'disabled title="Empty builds cannot be selected"'}>Select</button>
+                    </td>
+                </tr>`).join('');
+            return `
+                <div class="graph-build-doc">
+                    <h3>${escapeHtml(d.doc_id)} <span class="muted small">owner: ${escapeHtml(owner || 'ownerless')}</span></h3>
+                    <p class="muted small">Used by Query Bot: ${escapeHtml(d.in_use_job_id || 'none')}${d.active_job_id ? ' (admin choice)' : ' (newest non-empty build)'}</p>
+                    <table class="log-table">
+                        <thead>
+                            <tr><th>Job ID</th><th>Created</th><th>Nodes</th><th>Edges</th><th>Status</th><th></th></tr>
+                        </thead>
+                        <tbody>${rows}</tbody>
+                    </table>
+                    <button class="btn btn-ghost btn-sm" data-action="clear"
+                        data-doc-id="${escapeHtml(d.doc_id)}" data-owner="${escapeHtml(owner)}"
+                        ${d.active_job_id ? '' : 'disabled'}>Use newest non-empty build</button>
+                </div>`;
+        }).join('');
+    }
+
+    async function loadGraphBuilds() {
+        if (state.role !== 'admin') return;
+        const host = $('graphBuildsList');
+        if (!host) return;
+        try {
+            const res = await api('/admin/query-bot/documents');
+            renderGraphBuilds(res.documents || []);
+        } catch (e) {
+            host.innerHTML = `<p class="muted">Error loading graph builds: ${escapeHtml(e.message)}</p>`;
+        }
+    }
+
+    if ($('graphBuildsRefresh')) $('graphBuildsRefresh').addEventListener('click', loadGraphBuilds);
+
+    if ($('graphBuildsList')) {
+        $('graphBuildsList').addEventListener('click', async (e) => {
+            const btn = e.target.closest('button[data-action]');
+            if (!btn || btn.disabled) return;
+            const docId = btn.dataset.docId;
+            const owner = btn.dataset.owner || null;
+            btn.disabled = true;
+            try {
+                if (btn.dataset.action === 'select') {
+                    await api('/admin/query-bot/active-build', {
+                        method: 'PUT',
+                        json: { doc_id: docId, owner, job_id: btn.dataset.jobId },
+                    });
+                    showStatus('graphBuildsStatus', `Query Bot now uses build ${escapeHtml(btn.dataset.jobId)} for ${escapeHtml(docId)}.`, 'success');
+                } else {
+                    const qs = `doc_id=${encodeURIComponent(docId)}&owner=${encodeURIComponent(owner || '')}`;
+                    await api(`/admin/query-bot/active-build?${qs}`, { method: 'DELETE' });
+                    showStatus('graphBuildsStatus', `Query Bot now uses the newest non-empty build for ${escapeHtml(docId)}.`, 'success');
+                }
+                loadGraphBuilds();
+            } catch (err) {
+                showStatus('graphBuildsStatus', 'Failed: ' + escapeHtml(err.message), 'error');
+                btn.disabled = false;
+            }
+        });
+    }
+
     // ======================= Query Bot Tab =======================
 
     // Holds all extracted data and document map
     let qbAllExtractedData = null;
     let qbDocsMap = {};
+
+    // Shows which graph build answers for the selected document. Entries without a `graph` key
+    // come from in-memory jobs, so no build line is shown for them.
+    function updateQbBuildInfo(m) {
+        const info = $('tab_qb_graph_build');
+        if (!info) return;
+        const isGraph = !!m && ((m.strategy || '').startsWith('graph_memory') || m.has_graph);
+        if (!isGraph || m.graph === undefined) {
+            info.style.display = 'none';
+            info.textContent = '';
+            return;
+        }
+        info.style.display = 'block';
+        const g = m.graph;
+        if (m.graph_empty) {
+            info.textContent = 'Graph empty: every stored build has 0 nodes, so questions cannot be answered from it.';
+            return;
+        }
+        info.textContent = g
+            ? `Graph build: ${g.job_id} · ${g.created_at ? new Date(g.created_at).toLocaleString() : 'date unknown'} · ${g.node_count} nodes`
+            : 'No graph build';
+    }
 
     function updateQbModeBadge() {
         const docSelect = $('tab_qb_doc_select');
@@ -2520,12 +2923,18 @@
         if (!docSelect || !modeBadge) return;
         const selectedDocId = docSelect.value;
         const m = selectedDocId ? qbDocsMap[selectedDocId] : null;
+        updateQbBuildInfo(m);
         if (!m) {
             modeBadge.style.display = 'none';
             return;
         }
         const isGraph = (m.strategy || '').startsWith('graph_memory') || m.has_graph;
         modeBadge.style.display = 'inline-block';
+        if (m.graph_empty) {
+            modeBadge.className = 'badge badge-mute';
+            modeBadge.textContent = 'Graph empty';
+            return;
+        }
         modeBadge.className = 'badge ' + (isGraph ? 'badge-primary' : 'badge-secondary');
         modeBadge.textContent = isGraph ? 'Graph Memory' : 'JSON Fallback';
     }
@@ -2562,6 +2971,9 @@
                     has_graph: !!d.has_graph,
                     has_extracted: !!d.has_extracted,
                     job_id: d.job_id,
+                    owner: d.owner,
+                    graph: d.graph || null,
+                    graph_empty: !!d.graph_empty,
                     extracted_data: null,
                 };
             });
@@ -2623,7 +3035,7 @@
                 const prevVal = docSelect.value;
                 docSelect.innerHTML = docKeys.map(d => {
                     const m = qbDocsMap[d];
-                    const stratLabel = (m.strategy === 'graph_memory' || m.has_graph) ? 'graph_memory' : 'page_scan';
+                    const stratLabel = m.graph_empty ? 'graph empty' : ((m.strategy === 'graph_memory' || m.has_graph) ? 'graph_memory' : 'page_scan');
                     return `<option value="${escapeHtml(d)}">${escapeHtml(d)} (${stratLabel})</option>`;
                 }).join('');
 
@@ -2637,6 +3049,121 @@
             }
         } catch (e) {
             console.warn('loadAllExtractedData error', e);
+        }
+    }
+
+    const QB_STAGE_TEXT = {
+        searching_graph: 'Searching graph…',
+        reading_pages: 'Reading pages…',
+        answering: 'Answering…',
+    };
+
+    function parseSseBlock(block, onEvent) {
+        let name = 'message';
+        const dataLines = [];
+        block.split('\n').forEach((line) => {
+            if (line.startsWith('event:')) name = line.slice(6).trim();
+            else if (line.startsWith('data:')) dataLines.push(line.slice(5).replace(/^ /, ''));
+        });
+        if (!dataLines.length) return;
+        let data;
+        try {
+            data = JSON.parse(dataLines.join('\n'));
+        } catch (_) {
+            return;
+        }
+        onEvent(name, data);
+    }
+
+    // fetch with a ReadableStream, not EventSource: EventSource cannot send the bearer header.
+    async function streamQueryBot(payload, onEvent) {
+        const headers = { 'Content-Type': 'application/json', Accept: 'text/event-stream' };
+        if (state.token) headers['Authorization'] = 'Bearer ' + state.token;
+        const resp = await fetch(API_BASE + '/api/query-bot/ask/stream', {
+            method: 'POST',
+            headers,
+            body: JSON.stringify(payload),
+        });
+        if (resp.status === 401) {
+            logout();
+            throw new Error('Session expired or unauthorized. Please log in again.');
+        }
+        if (!resp.ok) {
+            let detail = `HTTP ${resp.status}`;
+            try {
+                const body = await resp.json();
+                detail = body.detail || detail;
+            } catch (_) { /* response was not JSON */ }
+            throw new Error(typeof detail === 'string' ? detail : JSON.stringify(detail));
+        }
+        const reader = resp.body.getReader();
+        const decoder = new TextDecoder();
+        let buffer = '';
+        for (;;) {
+            const { value, done } = await reader.read();
+            if (done) break;
+            buffer += decoder.decode(value, { stream: true });
+            let end = buffer.indexOf('\n\n');
+            while (end !== -1) {
+                parseSseBlock(buffer.slice(0, end), onEvent);
+                buffer = buffer.slice(end + 2);
+                end = buffer.indexOf('\n\n');
+            }
+        }
+        if (buffer.trim()) parseSseBlock(buffer, onEvent);
+    }
+
+    // Shows the source list collapsed by default: one "Page X — snippet" entry per page.
+    function renderQbSources(botDiv, sources, meta) {
+        const unique = window.QueryBotRender.dedupeSources(sources);
+        if (!unique.length) return;
+        const details = document.createElement('details');
+        details.className = 'qb-sources';
+        const summary = document.createElement('summary');
+        summary.textContent = `Sources (${unique.length})`;
+        const list = document.createElement('ul');
+        list.className = 'qb-source-list';
+        unique.forEach((src) => {
+            const item = document.createElement('li');
+            const btn = document.createElement('button');
+            btn.type = 'button';
+            btn.className = 'qb-source-link';
+            const text = window.QueryBotRender.snippet(src.evidence || src.node || '');
+            btn.textContent = `${window.QueryBotRender.sourceLabel(src)} \u2014 ${text}`;
+            btn.addEventListener('click', () => openQbSourcePage(meta, src.page, botDiv));
+            item.appendChild(btn);
+            list.appendChild(item);
+        });
+        details.append(summary, list);
+        botDiv.appendChild(details);
+    }
+
+    // Opens the stored markdown for the document and shows only the chunk between the page markers.
+    async function openQbSourcePage(meta, page, botDiv) {
+        if (!meta || !meta.doc_id) return;
+        let viewer = botDiv.querySelector('.qb-page-viewer');
+        if (!viewer) {
+            viewer = document.createElement('pre');
+            viewer.className = 'qb-page-viewer';
+            botDiv.appendChild(viewer);
+        }
+        const pageNo = String(page).replace(/\D/g, '');
+        if (!meta.owner) {
+            viewer.textContent = `Page ${pageNo} cannot be opened: the owner of ${meta.doc_id} is not known to this view.`;
+            return;
+        }
+        viewer.textContent = `Loading page ${pageNo}…`;
+        try {
+            const data = await api(ocrDocUrl('admin', { doc_id: meta.doc_id, owner: meta.owner }));
+            const markdown = data.markdown_content || '';
+            const re = new RegExp(`<!-- PAGE ${pageNo} [\\s\\S]*?<!-- /PAGE ${pageNo} -->`);
+            const match = re.exec(markdown);
+            viewer.textContent = match
+                ? `Page ${pageNo} of ${meta.doc_id}\n\n${match[0]}`
+                : `Page ${pageNo} is not in the stored markdown for ${meta.doc_id}.`;
+            viewer.scrollIntoView({ block: 'nearest' });
+        } catch (e) {
+            viewer.textContent = `Failed to load page ${pageNo}: ${e.message}`;
         }
     }
 
@@ -2670,7 +3197,10 @@
 
         const botDiv = document.createElement('div');
         botDiv.className = 'query-bot-msg bot loading';
-        botDiv.textContent = 'Searching document graph…';
+        const stageLine = document.createElement('div');
+        stageLine.className = 'qb-stage';
+        stageLine.textContent = QB_STAGE_TEXT.searching_graph;
+        botDiv.appendChild(stageLine);
         msgs.appendChild(botDiv);
         msgs.scrollTop = msgs.scrollHeight;
 
@@ -2684,40 +3214,58 @@
                 question,
                 doc_id: selectedDocId || undefined,
                 job_id: selectedMeta ? selectedMeta.job_id : undefined,
+                owner: (selectedMeta && selectedMeta.owner) ? selectedMeta.owner : undefined,
                 extracted_data: (selectedMeta && selectedMeta.extracted_data) ? selectedMeta.extracted_data : undefined,
             };
 
-            const res = await api('/api/query-bot/ask', {
-                method: 'POST',
-                json: reqPayload,
+            let sources = [];
+            let answered = false;
+            let streamEl = null;
+            await streamQueryBot(reqPayload, (name, data) => {
+                if (name === 'stage') {
+                    stageLine.textContent = QB_STAGE_TEXT[data.stage] || 'Working…';
+                } else if (name === 'token') {
+                    // Plain text while streaming. The sanitised Markdown replaces it on the answer event.
+                    if (!streamEl) {
+                        streamEl = el('div', 'qb-answer qb-answer-stream');
+                        botDiv.appendChild(streamEl);
+                    }
+                    streamEl.textContent += data.text || '';
+                    msgs.scrollTop = msgs.scrollHeight;
+                } else if (name === 'sources') {
+                    sources = data.sources || [];
+                } else if (name === 'answer') {
+                    answered = true;
+                    if (streamEl) streamEl.remove();
+                    stageLine.remove();
+                    botDiv.className = 'query-bot-msg bot';
+                    botDiv.appendChild(el('div', 'qb-answer', window.QueryBotRender.renderMarkdown(data.answer || 'No answer returned.')));
+                    renderQbSources(botDiv, sources, selectedMeta);
+
+                    const isGraph = data.mode === 'graph';
+                    const isEmptyGraph = data.mode === 'graph_empty';
+                    const badgeClass = isGraph ? 'badge-primary' : (isEmptyGraph ? 'badge-warn' : 'badge-secondary');
+                    const badgeText = isGraph ? 'Graph Memory' : (isEmptyGraph ? 'Empty Graph' : 'JSON Fallback');
+                    botDiv.appendChild(el('div', 'qb-mode-row', `<span class="badge ${badgeClass}">${badgeText}</span>`));
+
+                    if (modeBadge) {
+                        modeBadge.style.display = 'inline-block';
+                        modeBadge.className = `badge ${badgeClass}`;
+                        modeBadge.textContent = badgeText;
+                    }
+                } else if (name === 'done') {
+                    const ms = data.timings && data.timings.total_ms;
+                    if (ms !== undefined && ms !== null) {
+                        botDiv.appendChild(el('div', 'qb-timing', `Answered in ${(ms / 1000).toFixed(1)} s`));
+                    }
+                } else if (name === 'error') {
+                    throw new Error(data.detail || 'Query bot failed.');
+                }
             });
-
-            botDiv.className = 'query-bot-msg bot';
-
-            // Build rich answer HTML with source citations & mode badge
-            let ansHtml = `<div>${escapeHtml(res.answer || 'No answer returned.')}</div>`;
-
-            if (res.sources && res.sources.length > 0) {
-                ansHtml += '<div style="margin-top: 8px; padding-top: 6px; border-top: 1px dashed var(--border-light); font-size: 11px; opacity: 0.85;">';
-                res.sources.forEach(s => {
-                    const pg = s.page ? `Page ${s.page}` : 'Document';
-                    const ev = s.evidence ? `: "${escapeHtml(s.evidence)}"` : '';
-                    ansHtml += `<div style="margin-top: 2px;"><strong>[Source: ${escapeHtml(pg)}]</strong>${ev}</div>`;
-                });
-                ansHtml += '</div>';
-            }
-
-            const isGraph = res.mode === 'graph';
-            const badgeClass = isGraph ? 'badge-primary' : 'badge-secondary';
-            const badgeText = isGraph ? 'Graph Memory' : 'JSON Fallback';
-            ansHtml += `<div style="margin-top: 6px;"><span class="badge ${badgeClass}" style="font-size: 10px; font-weight: 500;">${badgeText}</span></div>`;
-
-            botDiv.innerHTML = ansHtml;
-
-            if (modeBadge) {
-                modeBadge.style.display = 'inline-block';
-                modeBadge.className = `badge ${badgeClass}`;
-                modeBadge.textContent = badgeText;
+            if (!answered) {
+                stageLine.remove();
+                botDiv.className = 'query-bot-msg bot';
+                botDiv.textContent = 'No answer returned.';
             }
         } catch (err) {
             botDiv.className = 'query-bot-msg bot error';
@@ -2872,6 +3420,8 @@
     }, 4000);
     // Text-only clock update between polls. It makes no network calls.
     setInterval(tickOcrElapsed, 1000);
+    // Live OCR jobs: one detail fetch per second while a job is running (see pollLiveOcrJobs).
+    setInterval(pollLiveOcrJobs, 1000);
 
 })();
 

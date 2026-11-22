@@ -40,7 +40,7 @@ class Settings(BaseSettings):
     # model id contains any of these, Converse sends additionalModelRequestFields
     # {reasoning_effort: ...}. Moved out of a hardcoded conditional so the
     # inference-profile id is config, not a magic string. Comma-separated via env.
-    bedrock_reasoning_model_markers: list[str] = ["gpt-oss", "qdtz23c8eis1"]
+    bedrock_reasoning_model_markers: list[str] = ["gpt-oss", "qdtz23c8eis1", "hjw00urjpx41"]
     bedrock_vlm_model_id: str = "arn:aws:bedrock:ap-south-1:106611079163:application-inference-profile/lmbukv3mwnhm"
 
     # Ollama (local) settings (kept for backwards compatibility)

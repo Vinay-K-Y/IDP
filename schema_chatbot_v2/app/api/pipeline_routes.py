@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import io
 import json
 import os
@@ -9,13 +10,15 @@ import tempfile
 import threading
 import time
 import uuid
-from datetime import datetime
+from collections import OrderedDict
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
 import pymupdf
 from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, Response, UploadFile
+from fastapi.responses import StreamingResponse
 from PIL import Image
 
 from app.core.activity_log import log_activity
@@ -47,8 +50,6 @@ router = APIRouter()
 
 class JobControl:
     def __init__(self) -> None:
-        self.pause_event = threading.Event()
-        self.pause_event.set()  # set = running; cleared = paused
         self.kill_event = threading.Event()  # set = kill requested
         self.progress = JobProgressTracker()  # page-level OCR progress for this job
 
@@ -168,21 +169,71 @@ def _build_pages_for_pdf(pdf_path: Path, pdf_bytes: Optional[bytes] = None) -> L
 # ========================= Documents =========================
 
 
+def _attach_document_status(docs: List[Dict[str, Any]], owner_or_star: str) -> None:
+    """Add status and job_id to each shared or private document. A document with no status reads as pending."""
+    from src.ai.layer3_extraction.storage import get_document_statuses, latest_status_by_doc
+
+    statuses = latest_status_by_doc(
+        get_document_statuses(owner_or_star, doc_ids=[d["name"] for d in docs])
+    )
+    for d in docs:
+        st = statuses.get(d["name"])
+        d["status"] = st["status"] if st else "pending"
+        d["job_id"] = st["job_id"] if st else None
+
+
+def _attach_ocr_status(items: List[Dict[str, Any]], owner_or_star: Optional[str]) -> None:
+    """Add status and job_id to OCR rows, matched on (owner, doc_id). A row with no status reads as completed."""
+    from src.ai.layer3_extraction.storage import get_document_statuses
+
+    if not items:
+        return
+    statuses = get_document_statuses(
+        owner_or_star or "*", doc_ids=[i["doc_id"] for i in items]
+    )
+    for item in items:
+        st = statuses.get((item["owner"], item["doc_id"]))
+        item["status"] = st["status"] if st else "completed"
+        item["job_id"] = st["job_id"] if st else None
+
+
+def _set_doc_status(owner: Optional[str], doc_id: str, job_id: str, status: str, error: Optional[str] = None) -> None:
+    """Persist one document's processing state. A failed write is logged and never fails the job."""
+    try:
+        from src.ai.layer3_extraction.storage import set_document_status
+        set_document_status(owner=owner, doc_id=doc_id, job_id=job_id, status=status, error=error)
+    except Exception as exc:
+        logger.warning("pipeline.document_status_write_failed", doc_id=doc_id, status=status, error=str(exc))
+
+
+def _mark_current_document(job: Dict[str, Any], status: str, error: Optional[str] = None) -> None:
+    """Write status for the document the job is working on. A job with no current document is skipped."""
+    doc = job.get("current_document")
+    if doc:
+        _set_doc_status(job.get("owner"), doc, job.get("job_id"), status, error)
+
+
 @router.get("/documents")
 def list_documents(
     _: User = Depends(require_admin),
     owner: Optional[str] = None,
 ) -> Dict[str, Any]:
     from src.ai.layer3_extraction import s3_documents as s3
-    from src.ai.layer3_extraction.storage import list_markdown_records
+    from src.ai.layer3_extraction.storage import list_output_summaries
 
-    # Processed outputs are DB-backed (converted markdown records).
-    output_records = list_markdown_records(owner=owner or "_admin")
+    # Processed outputs are DB-backed (converted markdown records). Admin runs store
+    # under the admin's username, so the admin view covers every owner unless filtered.
+    output_records = list_output_summaries(owner or "*")
     outputs = [
         {
             "name": o["name"],
+            "doc_id": o["doc_id"],
+            "owner": o["owner"],
             "size": o["size"],
             "modified": o["modified"],
+            "created_at": o["created_at"],
+            "job_id": o["job_id"],
+            "has_extracted": o["has_extracted"],
             "schema_ref": o.get("schema_ref") or ({"schema_id": o["schema_id"]} if o.get("schema_id") else None),
         }
         for o in output_records
@@ -215,13 +266,14 @@ def list_documents(
             {
                 "name": p.name,
                 "size": p.stat().st_size,
-                "modified": datetime.fromtimestamp(p.stat().st_mtime).isoformat(),
+                "modified": datetime.fromtimestamp(p.stat().st_mtime, tz=timezone.utc).isoformat(),
                 "has_output": _has_output(p.name),
                 "source": "disk",
             }
             for p in pdfs
         ]
 
+    _attach_document_status(docs, owner or "*")
     return {"documents": docs, "outputs": outputs}
 
 
@@ -393,6 +445,7 @@ def list_ocr_documents(
     """OCR'd documents from document_markdowns, all owners. owner filters to one owner."""
     from src.ai.layer3_extraction.storage import list_ocr_document_summaries
     items = list_ocr_document_summaries(owner=normalize_ocr_owner(owner), limit=limit + 1)
+    _attach_ocr_status(items, normalize_ocr_owner(owner))
     return ocr_list_payload(items, limit)
 
 
@@ -461,6 +514,7 @@ def pipeline_status(_: User = Depends(require_admin)) -> Dict[str, Any]:
                 "created_at": v["created_at"],
                 "total": len(v.get("targets", [])),
                 "completed": len(v.get("successes", [])) + len(v.get("failures", [])),
+                "current_document": v.get("current_document"),
                 "progress": compact_progress(_job_progress(k, v)),
             }
             for k, v in _pipeline_jobs.items()
@@ -482,46 +536,6 @@ def get_pipeline_job(job_id: str, _: User = Depends(require_admin)) -> Dict[str,
     return {**job, "progress": _job_progress(job_id, job)}
 
 
-@router.post("/pipeline/jobs/{job_id}/pause")
-def pause_pipeline_job(job_id: str, admin: User = Depends(require_admin)) -> Dict[str, Any]:
-    if job_id not in _pipeline_jobs:
-        raise HTTPException(status_code=404, detail="job not found")
-    job = _pipeline_jobs[job_id]
-    if job["status"] not in ("running", "queued"):
-        raise HTTPException(
-            status_code=400,
-            detail=f"Cannot pause job with status '{job['status']}'. Job must be 'running' or 'queued'."
-        )
-    ctrl = _job_controls.get(job_id)
-    if ctrl:
-        ctrl.pause_event.clear()
-        ctrl.progress.pause()
-    job["status"] = "paused"
-    logger.info("pipeline.job_paused", job_id=job_id)
-    log_activity(admin.username, "job_paused", {"job_id": job_id})
-    return {"job_id": job_id, "status": "paused", "message": f"Job {job_id} paused."}
-
-
-@router.post("/pipeline/jobs/{job_id}/resume")
-def resume_pipeline_job(job_id: str, admin: User = Depends(require_admin)) -> Dict[str, Any]:
-    if job_id not in _pipeline_jobs:
-        raise HTTPException(status_code=404, detail="job not found")
-    job = _pipeline_jobs[job_id]
-    if job["status"] != "paused":
-        raise HTTPException(
-            status_code=400,
-            detail=f"Cannot resume job with status '{job['status']}'. Job must be 'paused'."
-        )
-    ctrl = _job_controls.get(job_id)
-    if ctrl:
-        ctrl.pause_event.set()
-        ctrl.progress.resume()
-    job["status"] = "running"
-    logger.info("pipeline.job_resumed", job_id=job_id)
-    log_activity(admin.username, "job_resumed", {"job_id": job_id})
-    return {"job_id": job_id, "status": "running", "message": f"Job {job_id} resumed."}
-
-
 @router.post("/pipeline/jobs/{job_id}/kill")
 def kill_pipeline_job(job_id: str, admin: User = Depends(require_admin)) -> Dict[str, Any]:
     if job_id not in _pipeline_jobs:
@@ -535,9 +549,9 @@ def kill_pipeline_job(job_id: str, admin: User = Depends(require_admin)) -> Dict
     ctrl = _job_controls.get(job_id)
     if ctrl:
         ctrl.kill_event.set()
-        ctrl.pause_event.set()  # Unblock thread if it was paused
         ctrl.progress.kill_requested()
     job["status"] = "killed"
+    _mark_current_document(job, "cancelled")
     if not job.get("finished_at"):
         job["finished_at"] = datetime.now().astimezone().isoformat(timespec="seconds")
     logger.info("pipeline.job_kill_requested", job_id=job_id)
@@ -744,13 +758,7 @@ def _run_pipeline_job(
     t_start = time.monotonic()
     for pdf in targets:
         job["current_document"] = pdf.name
-        # Check before starting next PDF: pause wait loop and kill check
-        while not ctrl.kill_event.is_set():
-            if ctrl.pause_event.is_set():
-                break
-            ctrl.progress.mark_waiting()  # parked for a pause: the job is now 'paused', not 'pausing'
-            time.sleep(0.2)
-
+        # Check before starting next PDF: kill check
         if ctrl.kill_event.is_set():
             logger.info("pipeline.job_killed", job_id=job_id, pdf=pdf.name)
             job["status"] = "killed"
@@ -760,6 +768,7 @@ def _run_pipeline_job(
             return
 
         ctrl.progress.start_doc(pdf.name)
+        _set_doc_status(job_owner, pdf.name, job_id, "processing")
         owner = job.get("owner")
         job_out_dir = resolve_owner_output_dir(owner) if owner else OUTPUT_DIR
         job_out_dir.mkdir(parents=True, exist_ok=True)
@@ -807,6 +816,7 @@ def _run_pipeline_job(
                     overwrite=True,
                     ir_owner=job_owner,
                     on_page_complete=ctrl.progress.page_done,
+                    on_stage=ctrl.progress.record_stage,
                 )
             except Exception as proc_exc:
                 logger.warning("pipeline.process_document_failed", pdf=pdf.name, error=str(proc_exc))
@@ -923,6 +933,7 @@ def _run_pipeline_job(
             extracted_data = None
             db_id = None
             db_error = None
+            ext_error = None
             extract_elapsed = 0.0
             graph_meta: Dict[str, Any] = {}
 
@@ -1030,7 +1041,22 @@ def _run_pipeline_job(
                         db_error = str(db_exc)
                         logger.warning("pipeline.extract.db_save_failed", pdf=pdf.name, error=str(db_exc))
             except Exception as ext_exc:
+                ext_error = str(ext_exc)
                 logger.error("pipeline.layer3_extraction_failed", pdf=pdf.name, error=str(ext_exc))
+
+            # Completed only when the markdown and the extraction were both stored.
+            doc_problem = None
+            if md_db_record_id is None:
+                doc_problem = "Converted markdown was not saved to the database."
+            elif ext_error or db_error:
+                doc_problem = ext_error or db_error
+            # A kill request already wrote 'cancelled' for this document. Keep that status.
+            if not ctrl.kill_event.is_set():
+                _set_doc_status(
+                    job_owner, pdf.name, job_id,
+                    "failed" if doc_problem else "completed",
+                    error=doc_problem,
+                )
 
             job["successes"].append({
                 "pdf": pdf.name,
@@ -1057,6 +1083,8 @@ def _run_pipeline_job(
             })
         except Exception as exc:
             logger.error("pipeline.doc_failed", pdf=pdf.name, error=str(exc), error_type=type(exc).__name__)
+            if not ctrl.kill_event.is_set():  # keep 'cancelled' written by the kill request
+                _set_doc_status(job_owner, pdf.name, job_id, "failed", error=str(exc))
             job["failures"].append({
                 "pdf": pdf.name,
                 "error_type": type(exc).__name__,
@@ -1788,6 +1816,12 @@ class QueryBotRequest(BaseModel):
 
 
 
+def _is_admin_choice(session, doc_key: str, rec: Any) -> bool:
+    from src.ai.layer3_extraction.storage import get_active_choice
+    choice = get_active_choice(session, doc_key, rec.owner)
+    return bool(choice is not None and choice.job_id == rec.job_id)
+
+
 @router.get("/api/query-bot/documents")
 def get_query_bot_documents(
     user: User = Depends(get_current_user),
@@ -1799,10 +1833,14 @@ def get_query_bot_documents(
       2. Disk dataset_output/ (*.extracted.json, *.graph.json, *.schema_ref.json)
       3. Active in-memory pipeline jobs (_pipeline_jobs)
     """
+    from sqlalchemy.orm import defer
     from src.ai.layer3_extraction.storage import (
         init_db,
         SessionLocal,
         DocumentGraphRecord,
+        doc_key_for,
+        owner_key,
+        select_active_graph_row,
     )
 
     role_val = getattr(user.role, "value", user.role)
@@ -1815,13 +1853,26 @@ def get_query_bot_documents(
         init_db()
         session = SessionLocal()
         try:
-            q = session.query(DocumentGraphRecord)
+            q = session.query(DocumentGraphRecord).options(defer(DocumentGraphRecord.graph_json))
             if not is_admin:
                 # Regular user: see only own documents (no ownerless docs)
                 q = q.filter(DocumentGraphRecord.owner == user.username)
-            for rec in q.order_by(DocumentGraphRecord.created_at.desc()).all():
+            rows = q.order_by(DocumentGraphRecord.created_at.desc()).all()
+            groups: Dict[Tuple[str, str], List[Any]] = {}
+            for rec in rows:
+                groups.setdefault((doc_key_for(rec.doc_id), owner_key(rec.owner)), []).append(rec)
+            empty_docs: Dict[str, Any] = {}
+            for rec in rows:
+                # Newest first. Only the first non-empty build per document is listed.
+                doc_key = doc_key_for(rec.doc_id)
+                if doc_key in docs:
+                    continue
+                if (rec.node_count or 0) == 0:
+                    # Documents whose builds are all empty are listed as "graph empty" after the loop.
+                    empty_docs.setdefault(doc_key, rec)
+                    continue
                 stem = Path(rec.doc_id).stem
-                doc_key = f"{stem}.pdf" if not rec.doc_id.lower().endswith(".pdf") else rec.doc_id
+                in_use, _ = select_active_graph_row(session, groups[(doc_key, owner_key(rec.owner))], doc_key)
                 docs[doc_key] = {
                     "doc_id": doc_key,
                     "stem": stem,
@@ -1830,9 +1881,35 @@ def get_query_bot_documents(
                     "has_extracted": True,
                     "strategy": "graph_memory",
                     "source": "database",
-                    "job_id": rec.job_id,
+                    "job_id": in_use.job_id,
+                    "owner": in_use.owner,
+                    "created_at": in_use.created_at.isoformat() if in_use.created_at else None,
+                    "graph": {
+                        "job_id": in_use.job_id,
+                        "created_at": in_use.created_at.isoformat() if in_use.created_at else None,
+                        "node_count": in_use.node_count,
+                        "edge_count": in_use.edge_count,
+                        "owner": in_use.owner,
+                        "is_admin_choice": _is_admin_choice(session, doc_key, in_use),
+                    },
+                }
+            for doc_key, rec in empty_docs.items():
+                if doc_key in docs:
+                    continue
+                # Every stored build is empty. The bot answers with the "graph is empty" message.
+                docs[doc_key] = {
+                    "doc_id": doc_key,
+                    "stem": Path(rec.doc_id).stem,
+                    "label": doc_key,
+                    "has_graph": False,
+                    "graph_empty": True,
+                    "has_extracted": True,
+                    "strategy": "graph_memory",
+                    "source": "database",
+                    "job_id": None,
                     "owner": rec.owner,
                     "created_at": rec.created_at.isoformat() if rec.created_at else None,
+                    "graph": None,
                 }
         finally:
             session.close()
@@ -1871,7 +1948,7 @@ def get_query_bot_documents(
                             "owner": job_owner,
                             "created_at": job.get("created_at"),
                         }
-                    else:
+                    elif docs[doc_id].get("source") != "database":
                         docs[doc_id]["job_id"] = job_id
                         if strat:
                             docs[doc_id]["strategy"] = strat
@@ -1882,12 +1959,187 @@ def get_query_bot_documents(
     return {"documents": sorted_docs, "count": len(sorted_docs)}
 
 
-@router.post("/api/query-bot/ask")
-async def ask_query_bot(
-    req: QueryBotRequest,
-    user: User = Depends(get_current_user),
+class ActiveBuildRequest(BaseModel):
+    doc_id: str = Field(..., description="Document name as listed in the query bot")
+    owner: Optional[str] = Field(None, description="Owner of the graph copy. Empty means ownerless.")
+    job_id: str = Field(..., description="Graph build to use. Must belong to this document and have nodes.")
+
+
+def _admin_group_rows(session, doc_id: str, owner: Optional[str]) -> List[Any]:
+    """All graph builds for one document and owner, newest first. Ownerless means owner IS NULL."""
+    from sqlalchemy.orm import defer
+    from src.ai.layer3_extraction.storage import DocumentGraphRecord
+    stem = Path(doc_id).stem
+    q = session.query(DocumentGraphRecord).filter(DocumentGraphRecord.doc_id.in_([doc_id, f"{stem}.pdf", stem]))
+    q = q.filter(DocumentGraphRecord.owner.is_(None)) if not owner else q.filter(DocumentGraphRecord.owner == owner)
+    return q.options(defer(DocumentGraphRecord.graph_json)).order_by(
+        DocumentGraphRecord.created_at.desc(), DocumentGraphRecord.id.desc()
+    ).all()
+
+
+def _admin_build_group(session, doc_key: str, owner: Optional[str], rows: List[Any]) -> Dict[str, Any]:
+    """One document and owner with each build's status. rows must be newest first."""
+    from src.ai.layer3_extraction.storage import get_active_choice, select_active_graph_row
+    in_use, _ = select_active_graph_row(session, rows, doc_key)
+    choice = get_active_choice(session, doc_key, owner)
+    active_job_id = choice.job_id if choice is not None else None
+    builds = []
+    for r in rows:
+        is_empty = (r.node_count or 0) == 0
+        builds.append({
+            "job_id": r.job_id,
+            "created_at": r.created_at.isoformat() if r.created_at else None,
+            "node_count": r.node_count,
+            "edge_count": r.edge_count,
+            "strategy": r.strategy,
+            "is_empty": is_empty,
+            "selectable": (not is_empty) and bool(r.job_id),
+            "is_active": active_job_id is not None and r.job_id == active_job_id,
+            "in_use": in_use is not None and r.id == in_use.id,
+        })
+    return {
+        "doc_id": doc_key,
+        "owner": owner,
+        "active_job_id": active_job_id,
+        "in_use_job_id": in_use.job_id if in_use is not None else None,
+        "build_count": len(builds),
+        "empty_build_count": sum(1 for b in builds if b["is_empty"]),
+        "builds": builds,
+    }
+
+
+@router.get("/admin/query-bot/documents")
+def list_admin_query_bot_builds(_: User = Depends(require_admin)) -> Dict[str, Any]:
+    """Every graph build grouped by document and owner, with the admin choice and the build in use."""
+    from sqlalchemy.orm import defer
+    from src.ai.layer3_extraction.storage import init_db, SessionLocal, DocumentGraphRecord, doc_key_for, owner_key
+
+    init_db()
+    session = SessionLocal()
+    try:
+        rows = session.query(DocumentGraphRecord).options(defer(DocumentGraphRecord.graph_json)).order_by(
+            DocumentGraphRecord.created_at.desc(), DocumentGraphRecord.id.desc()
+        ).all()
+        groups: Dict[Tuple[str, str], List[Any]] = {}
+        for rec in rows:
+            groups.setdefault((doc_key_for(rec.doc_id), owner_key(rec.owner)), []).append(rec)
+        documents = [_admin_build_group(session, key[0], groups[key][0].owner, groups[key]) for key in groups]
+        return {"documents": documents, "count": len(documents)}
+    finally:
+        session.close()
+
+
+@router.put("/admin/query-bot/active-build")
+def set_admin_query_bot_build(body: ActiveBuildRequest, admin: User = Depends(require_admin)) -> Dict[str, Any]:
+    """Sets the graph build the query bot uses for one document and owner. Empty builds are refused."""
+    from src.ai.layer3_extraction.storage import init_db, SessionLocal, doc_key_for, set_active_choice
+
+    doc_id = validate_doc_id(body.doc_id)
+    owner = (body.owner or "").strip() or None
+    job_id = (body.job_id or "").strip()
+    if not job_id:
+        raise HTTPException(status_code=400, detail="job_id is required.")
+
+    init_db()
+    session = SessionLocal()
+    try:
+        rows = _admin_group_rows(session, doc_id, owner)
+        match = [r for r in rows if r.job_id == job_id]
+        if not match:
+            raise HTTPException(status_code=404, detail="No graph build with this job_id for this document and owner.")
+        chosen = next((r for r in match if (r.node_count or 0) > 0), None)
+        if chosen is None:
+            raise HTTPException(status_code=400, detail="The graph build has 0 nodes and cannot be used.")
+        doc_key = doc_key_for(doc_id)
+        set_active_choice(session, doc_key, owner, chosen.job_id, admin.username)
+        logger.info("query_bot.active_build_set", doc_id=doc_key, owner=owner, job_id=chosen.job_id, set_by=admin.username)
+        return _admin_build_group(session, doc_key, owner, _admin_group_rows(session, doc_id, owner))
+    finally:
+        session.close()
+
+
+@router.delete("/admin/query-bot/active-build")
+def clear_admin_query_bot_build(
+    doc_id: str = Query(...),
+    owner: Optional[str] = Query(None),
+    admin: User = Depends(require_admin),
 ) -> Dict[str, Any]:
+    """Removes the admin choice so the document uses the newest non-empty build again."""
+    from src.ai.layer3_extraction.storage import init_db, SessionLocal, doc_key_for, clear_active_choice
+
+    doc_id = validate_doc_id(doc_id)
+    owner = (owner or "").strip() or None
+    init_db()
+    session = SessionLocal()
+    try:
+        doc_key = doc_key_for(doc_id)
+        clear_active_choice(session, doc_key, owner)
+        logger.info("query_bot.active_build_cleared", doc_id=doc_key, owner=owner, set_by=admin.username)
+        return _admin_build_group(session, doc_key, owner, _admin_group_rows(session, doc_id, owner))
+    finally:
+        session.close()
+
+
+# Parsed graphs and their GraphQueryService, reused across questions (LRU, bounded).
+# Key: (owner, doc_id, updated_at). A changed updated_at makes a new key, so old entries age out.
+QUERY_GRAPH_CACHE_MAX = 16
+_query_graph_cache: "OrderedDict[tuple, tuple]" = OrderedDict()
+_query_graph_cache_lock = threading.Lock()
+
+
+def _query_cache_key(rec: Any) -> Optional[tuple]:
+    if rec.updated_at is None:
+        return None
+    return (rec.owner, rec.doc_id, rec.job_id, rec.updated_at.isoformat())
+
+
+def _query_cache_get(key: Optional[tuple]) -> Optional[tuple]:
+    if key is None:
+        return None
+    with _query_graph_cache_lock:
+        entry = _query_graph_cache.get(key)
+        if entry is not None:
+            _query_graph_cache.move_to_end(key)
+        return entry
+
+
+def _query_cache_put(key: Optional[tuple], entry: tuple) -> None:
+    if key is None:
+        return
+    with _query_graph_cache_lock:
+        _query_graph_cache[key] = entry
+        _query_graph_cache.move_to_end(key)
+        while len(_query_graph_cache) > QUERY_GRAPH_CACHE_MAX:
+            _query_graph_cache.popitem(last=False)
+
+
+def reset_query_graph_cache() -> None:
+    with _query_graph_cache_lock:
+        _query_graph_cache.clear()
+
+
+def _sse(event: str, data: Dict[str, Any]) -> str:
+    return f"event: {event}\ndata: {json.dumps(data, ensure_ascii=False, default=str)}\n\n"
+
+
+EMPTY_GRAPH_MSG_ADMIN = "The selected graph is empty. Choose another build in the admin panel."
+EMPTY_GRAPH_MSG_USER = "The selected graph is empty. Ask an admin to choose another build."
+
+
+def _graph_empty_answer(user: User) -> str:
+    role_val = getattr(user.role, "value", user.role)
+    is_admin = (role_val == "admin" or user.role == Role.ADMIN)
+    return EMPTY_GRAPH_MSG_ADMIN if is_admin else EMPTY_GRAPH_MSG_USER
+
+
+def _resolve_query_graph(req: QueryBotRequest, user: User) -> Tuple[Optional[tuple], bool, float, Dict[str, Any]]:
     """
+    Owner checks and graph lookup shared by POST /api/query-bot/ask and /api/query-bot/ask/stream.
+    Returns (graph_entry, cache_hit, load_ms, meta). graph_entry is (GraphMemory, GraphQueryService), or None
+    when no graph is available. meta is {"graph_job_id": str | None, "empty_only": bool}; empty_only is True
+    when the document has stored builds but all of them are empty and no payload graph was given.
+    Raises the same 400/403/404 errors as the original endpoint.
+
     Query Bot:
     1. If Document Graph Memory is available (from PostgreSQL DB, file checkpoint dataset_output/<stem>.graph.json,
        or request payload's graph_memory), queries the graph via GraphQueryService with bounded multi-hop traversal
@@ -1895,13 +2147,15 @@ async def ask_query_bot(
     2. Strictly enforces user/document isolation (User A cannot query User B's document graph).
     3. If no graph is found, falls back cleanly to the legacy extracted JSON LLM assistant (mode: "json_fallback").
     """
-    if not req.question.strip():
-        raise HTTPException(status_code=400, detail="Question cannot be empty.")
+    t_load = time.perf_counter()
 
+    from sqlalchemy.orm import defer
     from src.ai.layer3_extraction.storage import (
         init_db,
         SessionLocal,
         DocumentGraphRecord,
+        doc_key_for,
+        select_active_graph_row,
     )
     try:
         from src.ai.layer3_extraction.graph_agent.graph_memory import GraphMemory
@@ -1959,6 +2213,10 @@ async def ask_query_bot(
             )
 
     graph_dict = None
+    graph_cache_key = None
+    cached_entry = None
+    graph_job_id = None
+    empty_only = False
 
     # Validate doc_id up-front to prevent path traversal
     if req.doc_id:
@@ -1987,28 +2245,45 @@ async def ask_query_bot(
                     stem = Path(req.doc_id).stem
                     doc_candidates = [req.doc_id, f"{stem}.pdf", stem]
                     q = q.filter(DocumentGraphRecord.doc_id.in_(doc_candidates))
-                    if req.job_id:
-                        sub_q = q.filter_by(job_id=req.job_id)
-                        if sub_q.first():
-                            q = sub_q
-                elif req.job_id:
+                else:
                     q = q.filter_by(job_id=req.job_id)
                 if not is_admin:
-                    user_q = q.filter_by(owner=user.username)
-                    db_rec = user_q.order_by(DocumentGraphRecord.created_at.desc()).first()
-                    if not db_rec:
-                        any_rec = q.order_by(DocumentGraphRecord.created_at.desc()).first()
-                        if any_rec:
-                            _check_doc_access(any_rec.owner, user, is_admin)
+                    scoped_q = q.filter_by(owner=user.username)
+                elif req.owner:
+                    scoped_q = q.filter_by(owner=req.owner)
+                elif req.job_id:
+                    # Admin sent job_id without owner: keep the lookup inside the owner of that build.
+                    job_owner = q.filter_by(job_id=req.job_id).with_entities(DocumentGraphRecord.owner).first()
+                    if job_owner is None:
+                        scoped_q = q.filter_by(job_id=req.job_id)
+                    elif job_owner[0]:
+                        scoped_q = q.filter_by(owner=job_owner[0])
+                    else:
+                        scoped_q = q.filter(DocumentGraphRecord.owner.is_(None))
                 else:
-                    if req.owner:
-                        q = q.filter_by(owner=req.owner)
-                    db_rec = q.order_by(DocumentGraphRecord.created_at.desc()).first()
+                    scoped_q = q
+                scoped_rows = scoped_q.options(defer(DocumentGraphRecord.graph_json)).all()
+                # The server picks the build. req.job_id only narrows a lookup that has no doc_id.
+                db_rec, only_empty = select_active_graph_row(
+                    session, scoped_rows, doc_key_for(req.doc_id) if req.doc_id else None
+                )
+
+                if db_rec is None and not is_admin:
+                    any_rec = q.options(defer(DocumentGraphRecord.graph_json)).order_by(DocumentGraphRecord.created_at.desc()).first()
+                    if any_rec:
+                        _check_doc_access(any_rec.owner, user, is_admin)
 
                 if db_rec:
                     # Enforce isolation: ownerless is admin-only, user docs are owner-only
                     _check_doc_access(db_rec.owner, user, is_admin)
-                    graph_dict = db_rec.graph_json
+                    graph_job_id = db_rec.job_id
+                    graph_cache_key = _query_cache_key(db_rec)
+                    cached_entry = _query_cache_get(graph_cache_key)
+                    if cached_entry is None:
+                        # graph_json was deferred, so this loads it only on a cache miss.
+                        graph_dict = db_rec.graph_json
+                else:
+                    empty_only = only_empty
             finally:
                 session.close()
         except HTTPException:
@@ -2031,22 +2306,66 @@ async def ask_query_bot(
         elif "nodes" in req.extracted_data and "edges" in req.extracted_data:
             graph_dict = req.extracted_data
 
-    # Path A: Graph Memory answering
-    if GraphMemory and GraphQueryService and graph_dict and isinstance(graph_dict, dict) and "nodes" in graph_dict:
+    graph_entry = cached_entry
+    if graph_entry is None and GraphMemory and GraphQueryService and graph_dict and isinstance(graph_dict, dict) and "nodes" in graph_dict:
         try:
-            graph_mem = GraphMemory.from_dict(graph_dict)
-            service = GraphQueryService()
+            graph_entry = (GraphMemory.from_dict(graph_dict), GraphQueryService())
+            _query_cache_put(graph_cache_key, graph_entry)
+        except Exception as g_err:
+            logger.error("query_bot.graph_build_failed", error=str(g_err))
+    cache_hit = cached_entry is not None
+    load_ms = (time.perf_counter() - t_load) * 1000
+    meta = {"graph_job_id": graph_job_id, "empty_only": empty_only and graph_entry is None}
+    return graph_entry, cache_hit, load_ms, meta
+
+
+@router.post("/api/query-bot/ask")
+async def ask_query_bot(
+    req: QueryBotRequest,
+    user: User = Depends(get_current_user),
+) -> Dict[str, Any]:
+    """
+    Query Bot answer. Graph answers use the cached graph (see _resolve_query_graph); other
+    documents fall back to the extracted JSON, as before.
+    """
+    if not req.question.strip():
+        raise HTTPException(status_code=400, detail="Question cannot be empty.")
+
+    graph_entry, cache_hit, load_ms, meta = _resolve_query_graph(req, user)
+
+    # Every stored build for this document is empty: answer without the graph or the LLM.
+    if graph_entry is None and meta["empty_only"]:
+        return {
+            "success": True,
+            "question": req.question,
+            "answer": _graph_empty_answer(user),
+            "sources": [],
+            "doc_id": req.doc_id,
+            "mode": "graph_empty",
+            "graph_job_id": None,
+        }
+
+    # Path A: Graph Memory answering
+    if graph_entry is not None:
+        try:
+            graph_mem, service = graph_entry
             result = service.query(graph_mem, req.question)
+            timings = {**result.timings, "graph_load_ms": round(load_ms, 1), "cache_hit": cache_hit}
+            logger.info("query_bot.stage_timing", doc_id=req.doc_id, itemised=result.itemised, **timings)
             return {
                 "success": True,
                 "question": req.question,
                 "answer": result.answer,
-                "sources": result.sources[:5] if result.sources else [],
+                "sources": result.sources,
                 "doc_id": req.doc_id,
                 "mode": "graph",
+                "graph_job_id": meta["graph_job_id"],
                 "hops_traversed": result.hops_traversed,
                 "retrieved_nodes_count": len(result.retrieved_nodes),
                 "retrieved_edges_count": len(result.retrieved_edges),
+                "itemised": result.itemised,
+                "total_check": result.total_check,
+                "timings": timings,
             }
         except Exception as g_err:
             logger.error("query_bot.graph_query_failed", error=str(g_err))
@@ -2270,6 +2589,98 @@ async def ask_query_bot(
     except Exception as exc:
         logger.exception("query_bot.error")
         raise HTTPException(status_code=500, detail=f"Query bot failed: {exc}")
+
+
+_SSE_HEADERS = {"Cache-Control": "no-cache", "X-Accel-Buffering": "no"}
+
+
+@router.post("/api/query-bot/ask/stream")
+async def ask_query_bot_stream(
+    req: QueryBotRequest,
+    user: User = Depends(get_current_user),
+) -> StreamingResponse:
+    """
+    Query Bot as server-sent events. Events arrive in this order:
+      stage   {"stage": "searching_graph" | "reading_pages" | "answering"}
+      token   {"text"}                    raw answer text as the model streams it (may be unsanitised)
+      sources {"sources": [...]}          one entry per page, sorted by page
+      answer  {"answer", "mode", "itemised", "total_check"}
+      done    {"mode", "timings"}
+    Owner checks run before the stream starts, so 400, 403 and 404 are normal HTTP errors.
+    A document without a graph sends its JSON-fallback answer as one answer event.
+    """
+    if not req.question.strip():
+        raise HTTPException(status_code=400, detail="Question cannot be empty.")
+    graph_entry, cache_hit, load_ms, meta = _resolve_query_graph(req, user)
+    if graph_entry is None and meta["empty_only"]:
+        events = _stream_graph_empty(req, user)
+    elif graph_entry is None:
+        events = _stream_json_fallback(req, user)
+    else:
+        events = _stream_graph_answer(graph_entry, req, cache_hit, load_ms, meta["graph_job_id"])
+    return StreamingResponse(events, media_type="text/event-stream", headers=_SSE_HEADERS)
+
+
+async def _stream_graph_empty(req: QueryBotRequest, user: User):
+    yield _sse("stage", {"stage": "searching_graph"})
+    yield _sse("answer", {"answer": _graph_empty_answer(user), "mode": "graph_empty",
+                          "itemised": False, "total_check": {}})
+    yield _sse("done", {"mode": "graph_empty", "doc_id": req.doc_id, "timings": {}})
+
+
+async def _stream_json_fallback(req: QueryBotRequest, user: User):
+    yield _sse("stage", {"stage": "answering"})
+    try:
+        result = await ask_query_bot(req, user)
+    except HTTPException as exc:
+        yield _sse("error", {"status": exc.status_code, "detail": exc.detail})
+        return
+    yield _sse("sources", {"sources": result.get("sources", [])})
+    yield _sse("answer", {"answer": result.get("answer", ""), "mode": result.get("mode"),
+                          "itemised": False, "total_check": {}})
+    yield _sse("done", {"mode": result.get("mode"), "timings": {}})
+
+
+async def _stream_graph_answer(graph_entry: tuple, req: QueryBotRequest, cache_hit: bool, load_ms: float, graph_job_id: Optional[str] = None):
+    graph_mem, service = graph_entry
+    loop = asyncio.get_running_loop()
+    queue: asyncio.Queue = asyncio.Queue()
+
+    def _put(item: tuple) -> None:
+        loop.call_soon_threadsafe(queue.put_nowait, item)
+
+    def _work() -> None:
+        try:
+            result = service.query(
+                graph_mem, req.question,
+                on_stage=lambda stage: _put(("stage", stage)),
+                on_token=lambda text: _put(("token", text)),
+            )
+            _put(("result", result))
+        except Exception as exc:
+            logger.error("query_bot.stream_failed", error=str(exc))
+            _put(("error", str(exc)))
+
+    loop.run_in_executor(None, _work)
+    while True:
+        kind, payload = await queue.get()
+        if kind == "stage":
+            yield _sse("stage", {"stage": payload})
+        elif kind == "token":
+            yield _sse("token", {"text": payload})
+        elif kind == "error":
+            yield _sse("error", {"status": 500, "detail": "Query bot failed while answering."})
+            return
+        else:
+            result = payload
+            timings = {**result.timings, "graph_load_ms": round(load_ms, 1), "cache_hit": cache_hit}
+            logger.info("query_bot.stage_timing", doc_id=req.doc_id, itemised=result.itemised, **timings)
+            yield _sse("sources", {"sources": result.sources})
+            yield _sse("answer", {"answer": result.answer, "mode": "graph",
+                                  "itemised": result.itemised, "total_check": result.total_check})
+            yield _sse("done", {"mode": "graph", "doc_id": req.doc_id, "graph_job_id": graph_job_id,
+                                "hops_traversed": result.hops_traversed, "timings": timings})
+            return
 
 
 

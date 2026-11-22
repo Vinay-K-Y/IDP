@@ -13,6 +13,7 @@ from __future__ import annotations
 import base64
 import io
 import json
+import time
 from typing import Any, Optional
 import numpy as np
 from PIL import Image
@@ -248,14 +249,38 @@ def _ocr_convert(
     Common execution path for PaddleOCR conversion (printed or handwritten).
     Prioritizes dedicated AWS Lambda PaddleOCR engine when available/preferred;
     falls back seamlessly to local in-process PaddleOCR engine.
+
+    Logs one 'layer2.ocr.timing' line per call with the backend used and ocr_ms
+    (wall time of this call, including any Lambda attempt that failed first).
     """
+    t0 = time.monotonic()
+    result, backend = _ocr_convert_inner(image_array, page_number, mode, image_bytes, ocr_lang)
+    logger.info(
+        "layer2.ocr.timing",
+        mode=mode,
+        page_number=page_number,
+        backend=backend,
+        ocr_ms=round((time.monotonic() - t0) * 1000, 1),
+        chars_out=len(result[0]),
+    )
+    return result
+
+
+def _ocr_convert_inner(
+    image_array: Any,
+    page_number: int,
+    mode: str,
+    image_bytes: Optional[bytes] = None,
+    ocr_lang: Optional[str] = None,
+) -> tuple[tuple[str, float, list[Block]], str]:
+    """Returns ((markdown, confidence, blocks), backend) where backend is lambda, local or failed."""
     engine_name = "paddleocr_handwritten" if mode == "handwritten" else "paddleocr_printed"
 
     # 1. Try AWS Lambda PaddleOCR offload first if preferred
     if getattr(settings, "paddle_prefer_lambda", True):
         lambda_result = _invoke_paddle_lambda(image_array, page_number, mode, image_bytes, ocr_lang=ocr_lang)
         if lambda_result is not None:
-            return lambda_result
+            return lambda_result, "lambda"
 
         # In production/staging, do not run heavy local OCR in the web container to prevent OOM
         if getattr(settings, "app_env", "development") in ("production", "staging"):
@@ -263,7 +288,7 @@ def _ocr_convert(
                 f"layer2.{mode}.lambda_failed_skipping_local_in_prod",
                 page_number=page_number,
             )
-            return "", 0.0, []
+            return ("", 0.0, []), "failed"
 
     # 2. In-process PaddleOCR engine (local execution for dev/test)
     try:
@@ -285,7 +310,7 @@ def _ocr_convert(
             avg_confidence=round(avg_confidence, 4),
             blocks_count=len(blocks),
         )
-        return markdown, avg_confidence, blocks
+        return (markdown, avg_confidence, blocks), "local"
 
     except (ImportError, ModuleNotFoundError) as imp_err:
         logger.warning(
@@ -297,7 +322,7 @@ def _ocr_convert(
         # If lambda was not preferred or failed initially, attempt Lambda invocation now
         lambda_result = _invoke_paddle_lambda(image_array, page_number, mode, image_bytes, ocr_lang=ocr_lang)
         if lambda_result is not None:
-            return lambda_result
+            return lambda_result, "lambda"
 
         logger.error(
             f"layer2.{mode}.failed",
@@ -305,7 +330,7 @@ def _ocr_convert(
             error=str(imp_err),
             error_type=type(imp_err).__name__,
         )
-        return "", 0.0, []
+        return ("", 0.0, []), "failed"
 
     except Exception as exc:
         # If in-process execution failed with another error, try Lambda as a fallback
@@ -316,7 +341,7 @@ def _ocr_convert(
         )
         lambda_result = _invoke_paddle_lambda(image_array, page_number, mode, image_bytes, ocr_lang=ocr_lang)
         if lambda_result is not None:
-            return lambda_result
+            return lambda_result, "lambda"
 
         logger.error(
             f"layer2.{mode}.failed",
@@ -324,7 +349,7 @@ def _ocr_convert(
             error=str(exc),
             error_type=type(exc).__name__,
         )
-        return "", 0.0, []
+        return ("", 0.0, []), "failed"
 
 
 # ---------------------------------------------------------------------------

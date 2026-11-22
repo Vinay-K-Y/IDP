@@ -120,25 +120,23 @@ def test_concurrent_page_done_never_loses_or_overshoots_counts():
     assert overshoot == []
 
 
-def test_eta_is_hidden_early_and_correct_later():
+def test_eta_is_hidden_before_first_page_and_shown_after_it():
     clock = FakeClock()
     tracker, job = _tracker(clock)
     tracker.start_job([40])
     tracker.start_doc("a.pdf")
     tracker.begin_ocr(40)
 
-    clock.advance(2.0)
-    tracker.page_done()
-    assert tracker.live()["eta_s"] is None  # one page is too few for an estimate
+    clock.advance(5.0)
+    assert tracker.live()["eta_s"] is None  # no page finished yet
 
-    clock.advance(0.5)
-    tracker.page_done()
-    assert tracker.live()["eta_s"] is None  # two pages, but only 2.5 s of OCR time
+    clock.advance(0.0)
+    tracker.page_done()  # first page at 5 s: 1 page per 5 s, 39 left
+    assert tracker.live()["eta_s"] == 195
 
-    clock.advance(0.5)
-    live = tracker.live()
-    assert live["pages_done"] == 2
-    assert live["eta_s"] == 57  # 38 pages left at 3.0 s / 2 pages = 1.5 s each
+    clock.advance(0.4)
+    tracker.page_done()  # 2 pages at 5.4 s: window rate 2 / 5.4, 38 left
+    assert tracker.live()["eta_s"] == 103  # 38 * 5.4 / 2 = 102.6, rounded
 
     # 10 pages in 20 s, 30 left: 2 s per page, so 60 s left.
     clock2 = FakeClock()
@@ -152,37 +150,125 @@ def test_eta_is_hidden_early_and_correct_later():
     assert t2.live()["eta_s"] == 60
 
 
-def test_pause_time_is_excluded_from_elapsed_and_ocr_time():
+def test_eta_is_a_moving_average_over_recent_pages():
+    clock = FakeClock()
+    tracker, _ = _tracker(clock)
+    tracker.start_job([40])
+    tracker.start_doc("a.pdf")
+    tracker.begin_ocr(40)
+    for _ in range(10):  # ten fast pages at 1 s each
+        clock.advance(1.0)
+        tracker.page_done()
+    for _ in range(10):  # then ten slow pages at 4 s each
+        clock.advance(4.0)
+        tracker.page_done()
+    # The cumulative average is 50 s / 20 pages = 2.5 s per page, which would give 50 s.
+    # The last 10 pages average 4 s per page, so 20 pages left take 80 s.
+    assert tracker.live()["eta_s"] == 80
+
+
+def test_pages_completed_is_monotonic_under_concurrency_and_in_flight_returns_to_zero():
     clock = FakeClock()
     tracker, job = _tracker(clock)
-    tracker.start_job([10])
+    total = 3000
+    tracker.start_job([total])
+    tracker.start_doc("big.pdf")
+    tracker.begin_ocr(total)
+
+    seen_done = []
+    seen_flight = []
+    stop = threading.Event()
+
+    def reader():
+        while not stop.is_set():
+            p = job["progress"]
+            seen_done.append(p["pages_done"])
+            seen_flight.append(p["pages_in_flight"])
+
+    def worker(first):
+        # Each worker runs its pages one after another, like one slot of the page pool.
+        for page in range(first, first + total // 25):
+            tracker.record_stage(page, "ocr_start")
+            tracker.page_done(page)
+
+    watcher = threading.Thread(target=reader)
+    watcher.start()
+    workers = [threading.Thread(target=worker, args=(1 + i * (total // 25),)) for i in range(25)]
+    for w in workers:
+        w.start()
+    for w in workers:
+        w.join()
+    stop.set()
+    watcher.join()
+
+    assert seen_done == sorted(seen_done)
+    assert max(seen_done) <= total
+    assert 0 <= min(seen_flight) and max(seen_flight) <= 25
+    final = job["progress"]
+    assert final["pages_done"] == total
+    assert final["pages_in_flight"] == 0
+
+
+def test_out_of_order_completions_are_counted_and_in_flight_tracks_open_pages():
+    clock = FakeClock()
+    tracker, job = _tracker(clock)
+    tracker.start_job([4])
     tracker.start_doc("a.pdf")
-    tracker.begin_ocr(10)
+    tracker.begin_ocr(4)
+    for page in (1, 2, 3, 4):
+        tracker.record_stage(page, "ocr_start")
+    assert job["progress"]["pages_in_flight"] == 4
 
-    clock.advance(5.0)
-    tracker.pause()
-    # Pause requested, but the worker is still inside the current document: not paused yet.
-    assert job["progress"]["paused_since"] is None
-    clock.advance(2.0)
-    assert tracker.live()["elapsed_s"] == 7.0
-
-    tracker.mark_waiting()  # worker parks at t=7
-    assert job["progress"]["paused_since"] is not None
-
+    seq_before = job["progress"]["events_seq"]
     clock.advance(10.0)
-    paused_view = tracker.live()
-    assert paused_view["elapsed_s"] == 7.0
-    assert paused_view["ocr_s"] == 7.0
-    assert paused_view["paused_total_s"] == 10.0
-    assert paused_view["eta_s"] is None
+    tracker.page_done(4)
+    tracker.page_done(2)
+    tracker.page_done(3)
+    p = job["progress"]
+    assert p["pages_done"] == 3
+    assert p["pages_in_flight"] == 1
+    assert p["events_seq"] > seq_before
+    assert [e["page"] for e in p["recent_events"] if e["stage"] == "ocr_done"] == [4, 2, 3]
+    seqs = [e["seq"] for e in p["recent_events"]]
+    assert seqs == sorted(seqs)
 
-    tracker.resume()
-    assert job["progress"]["paused_since"] is None
-    clock.advance(5.0)
-    live = tracker.live()
-    assert live["elapsed_s"] == 12.0
-    assert live["ocr_s"] == 12.0
-    assert live["paused_total_s"] == 10.0
+    tracker.page_done(1)
+    assert job["progress"]["pages_in_flight"] == 0
+    assert job["progress"]["pages_done"] == 4
+
+
+def test_stage_events_are_recorded_in_order_and_invalid_stage_is_rejected():
+    clock = FakeClock()
+    tracker, job = _tracker(clock)
+    tracker.start_job([1])
+    tracker.record_stage(None, "probe_start")
+    tracker.record_stage(None, "probe_done")
+    tracker.record_stage(1, "inspect_done")
+    tracker.record_stage(1, "route_done")
+    tracker.record_stage(1, "ocr_start")
+    assert job["progress"]["stage"] == "ocr_start"
+    assert [e["stage"] for e in job["progress"]["recent_events"]] == [
+        "probe_start", "probe_done", "inspect_done", "route_done", "ocr_start",
+    ]
+    with pytest.raises(ValueError):
+        tracker.record_stage(1, "not_a_stage")
+
+
+def test_document_failure_clears_in_flight_pages_and_skips_the_rest():
+    clock = FakeClock()
+    tracker, job = _tracker(clock)
+    tracker.start_job([3])
+    tracker.start_doc("a.pdf")
+    tracker.begin_ocr(3)
+    tracker.record_stage(1, "ocr_start")
+    tracker.record_stage(2, "ocr_start")
+    tracker.page_done(1)
+    # Page 2 raised, so page_done is never called for it.
+    tracker.finish_doc()
+    p = job["progress"]
+    assert p["pages_in_flight"] == 0
+    assert p["pages_done"] == 1
+    assert p["pages_skipped"] == 2
 
 
 def test_elapsed_ticks_between_reads_and_stops_at_finish():
@@ -256,13 +342,11 @@ def test_kill_requested_then_finish_marks_killed_and_stops_clock():
     tracker.start_doc("a.pdf")
     tracker.begin_ocr(10)
     clock.advance(2.0)
-    tracker.pause()
     tracker.kill_requested()
     assert job["progress"]["phase"] == "killed"
-    assert job["progress"]["paused_since"] is None
 
-    # 2 s running, then pause and kill at t=2 (kill clears the pause), then 1 s
-    # more until the worker reports the job stopped at t=3.
+    # 2 s running, then kill at t=2, then 1 s more until the worker reports
+    # the job stopped at t=3.
     clock.advance(1.0)
     tracker.finish("killed")
     assert tracker.live()["elapsed_s"] == 3.0
@@ -277,27 +361,16 @@ def test_compact_progress_keeps_list_keys_only():
     tracker.start_job([2])
     compact = compact_progress(tracker.live())
     assert set(compact) == {
-        "phase", "pages_done", "pages_total", "pages_skipped",
+        "phase", "pages_done", "pages_total", "pages_skipped", "pages_in_flight",
+        "events_seq", "stage",
         "docs_done", "docs_total", "elapsed_s", "eta_s",
-        "paused_since", "stopping",
+        "stopping",
         "ocr_elapsed_s", "graph_elapsed_s", "ocr_started_at", "ocr_finished_at",
         "graph_started_at", "graph_finished_at", "server_now",
     }
     assert compact_progress(None) is None
 
 
-def test_paused_job_list_row_reports_parked_pause():
-    clock = FakeClock()
-    tracker, job = _tracker(clock)
-    tracker.start_job([4])
-    tracker.start_doc("a.pdf")
-    tracker.begin_ocr(4)
-    tracker.pause()
-    # Pause requested but the worker is still on the document: 'pausing', no paused_since yet.
-    assert compact_progress(tracker.live())["paused_since"] is None
-    tracker.mark_waiting()
-    compact = compact_progress(tracker.live())
-    assert compact["paused_since"] is not None
     assert compact["stopping"] is False
 
 
@@ -368,9 +441,10 @@ OLD_USER_LIST_KEYS = {
     "failed", "remaining", "total", "created_at",
 }
 PROGRESS_KEYS = {
-    "phase", "pages_total", "pages_done", "pages_skipped", "current_doc",
+    "phase", "pages_total", "pages_done", "pages_skipped", "pages_in_flight",
+    "pages_completed", "events_seq", "stage", "recent_events", "current_doc",
     "current_doc_pages_total", "current_doc_pages_done", "docs_total",
-    "docs_done", "started_at", "updated_at", "paused_since", "paused_total_s",
+    "docs_done", "started_at", "updated_at",
     "ocr_s", "elapsed_s", "eta_s",
 }
 
@@ -638,25 +712,6 @@ def test_kill_during_graph_build_keeps_graph_timer_until_step_ends():
     assert live["graph_elapsed_s"] == 6.0
     assert live["ocr_elapsed_s"] == 3.0
     assert job["progress"]["phase"] == "killed"
-
-
-def test_pause_requested_during_ocr_keeps_ocr_timer_until_document_ends():
-    clock = FakeClock()
-    tracker, job = _tracker(clock)
-    tracker.start_job([3])
-    tracker.start_doc("a.pdf")
-    tracker.begin_ocr(3)
-    clock.advance(2.0)
-    tracker.pause()
-    clock.advance(3.0)
-    assert tracker.live()["ocr_elapsed_s"] == 5.0  # pausing: the document is still running
-    tracker.finish_ocr()
-    clock.advance(1.0)
-    tracker.mark_waiting()  # parked between documents at t=6
-    clock.advance(10.0)
-    live = tracker.live()
-    assert live["ocr_elapsed_s"] == 5.0
-    assert live["paused_total_s"] == 10.0
 
 
 def test_failed_ocr_leaves_ocr_phase_when_document_ends():

@@ -8,7 +8,7 @@ import json
 import tempfile
 import threading
 import uuid
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -19,7 +19,10 @@ from app.api.pipeline_routes import (
     OCR_DOC_LIST_MAX,
     SCHEMA_REGISTRY,
     JobControl,
+    _attach_document_status,
+    _attach_ocr_status,
     _job_controls,
+    _mark_current_document,
     _pipeline_jobs,
     _run_pipeline_job,
     download_job_pdf_report,
@@ -100,20 +103,20 @@ def list_my_documents(user: User = Depends(get_current_user)) -> Dict[str, Any]:
             {"name": d["name"], "size": d["size"], "modified": d["modified"], "source": "s3"}
             for d in sorted(s3.list_user_documents(user.username), key=lambda x: x["name"].lower())
         ]
-        return {"documents": docs}
-    user_dir = _user_docs_dir(user.username)
-    pdfs = sorted([p for p in user_dir.glob("*.pdf") if p.is_file()])
-    return {
-        "documents": [
+    else:
+        user_dir = _user_docs_dir(user.username)
+        pdfs = sorted([p for p in user_dir.glob("*.pdf") if p.is_file()])
+        docs = [
             {
                 "name": p.name,
                 "size": p.stat().st_size,
-                "modified": datetime.fromtimestamp(p.stat().st_mtime).isoformat(),
+                "modified": datetime.fromtimestamp(p.stat().st_mtime, tz=timezone.utc).isoformat(),
                 "source": "disk",
             }
             for p in pdfs
-        ],
-    }
+        ]
+    _attach_document_status(docs, user.username)
+    return {"documents": docs}
 
 
 @router.delete("/documents/{filename}")
@@ -157,13 +160,18 @@ def list_my_outputs(user: User = Depends(get_current_user)) -> Dict[str, Any]:
     """
     List processed-output (extracted) files that belong to the calling user.
     """
-    from src.ai.layer3_extraction.storage import list_markdown_records_for_owner
-    records = list_markdown_records_for_owner(user.username)
+    from src.ai.layer3_extraction.storage import list_output_summaries
+    records = list_output_summaries(user.username)
     outputs = [
         {
             "name": o["name"],
+            "doc_id": o["doc_id"],
+            "owner": o["owner"],
             "size": o["size"],
             "modified": o["modified"],
+            "created_at": o["created_at"],
+            "job_id": o["job_id"],
+            "has_extracted": o["has_extracted"],
             "schema_ref": o.get("schema_ref") or ({"schema_id": o["schema_id"]} if o.get("schema_id") else None),
         }
         for o in records
@@ -317,46 +325,6 @@ def my_pipeline_status(user: User = Depends(get_current_user)) -> Dict[str, Any]
     return {"jobs": user_jobs}
 
 
-@router.post("/pipeline/jobs/{job_id}/pause")
-def pause_my_pipeline_job(job_id: str, user: User = Depends(get_current_user)) -> Dict[str, Any]:
-    job = _pipeline_jobs.get(job_id)
-    if not job or job.get("owner") != user.username:
-        raise HTTPException(status_code=404, detail="job not found")
-    if job["status"] not in ("running", "queued"):
-        raise HTTPException(
-            status_code=400,
-            detail=f"Cannot pause job with status '{job['status']}'. Job must be 'running' or 'queued'."
-        )
-    ctrl = _job_controls.get(job_id)
-    if ctrl:
-        ctrl.pause_event.clear()
-        ctrl.progress.pause()
-    job["status"] = "paused"
-    logger.info("pipeline.user_job_paused", job_id=job_id, username=user.username)
-    log_activity(user.username, "job_paused", {"job_id": job_id})
-    return {"job_id": job_id, "status": "paused", "message": f"Job {job_id} paused."}
-
-
-@router.post("/pipeline/jobs/{job_id}/resume")
-def resume_my_pipeline_job(job_id: str, user: User = Depends(get_current_user)) -> Dict[str, Any]:
-    job = _pipeline_jobs.get(job_id)
-    if not job or job.get("owner") != user.username:
-        raise HTTPException(status_code=404, detail="job not found")
-    if job["status"] != "paused":
-        raise HTTPException(
-            status_code=400,
-            detail=f"Cannot resume job with status '{job['status']}'. Job must be 'paused'."
-        )
-    ctrl = _job_controls.get(job_id)
-    if ctrl:
-        ctrl.pause_event.set()
-        ctrl.progress.resume()
-    job["status"] = "running"
-    logger.info("pipeline.user_job_resumed", job_id=job_id, username=user.username)
-    log_activity(user.username, "job_resumed", {"job_id": job_id})
-    return {"job_id": job_id, "status": "running", "message": f"Job {job_id} resumed."}
-
-
 @router.post("/pipeline/jobs/{job_id}/kill")
 def kill_my_pipeline_job(job_id: str, user: User = Depends(get_current_user)) -> Dict[str, Any]:
     job = _pipeline_jobs.get(job_id)
@@ -370,9 +338,9 @@ def kill_my_pipeline_job(job_id: str, user: User = Depends(get_current_user)) ->
     ctrl = _job_controls.get(job_id)
     if ctrl:
         ctrl.kill_event.set()
-        ctrl.pause_event.set()
         ctrl.progress.kill_requested()
     job["status"] = "killed"
+    _mark_current_document(job, "cancelled")
     if not job.get("finished_at"):
         job["finished_at"] = datetime.now().astimezone().isoformat(timespec="seconds")
     logger.info("pipeline.user_job_kill_requested", job_id=job_id, username=user.username)
@@ -402,6 +370,7 @@ def list_my_ocr_documents(
     """OCR'd documents owned by the caller. The owner is the caller's username, never a request parameter."""
     from src.ai.layer3_extraction.storage import list_ocr_document_summaries
     items = list_ocr_document_summaries(owner=user.username, limit=limit + 1)
+    _attach_ocr_status(items, user.username)
     return ocr_list_payload(items, limit)
 
 
